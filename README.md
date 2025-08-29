@@ -11,7 +11,7 @@ A tiny DPoP proof verifier for Rust:
 
 ```toml
 [dependencies]
-oauth-dpop = "0.1"
+oauth-dpop = { git = "https://github.com/ukonhattu/dpop-verifier"}
 ```
 ```rust
 use oauth_dpop::{verify_proof, VerifyOptions, ReplayStore, ReplayContext, DpopError};
