@@ -1,7 +1,7 @@
 #[cfg(feature = "actix-web")]
 pub fn canonicalize_request_url(req: &actix_web::HttpRequest) -> String {
     let ci = req.connection_info();
-    let mut scheme = ci.scheme().to_ascii_lowercase();
+    let scheme = ci.scheme().to_ascii_lowercase();
     let mut host = ci.host().to_string();
 
     // drop default ports
