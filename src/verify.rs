@@ -59,10 +59,18 @@ pub async fn verify_proof<S: ReplayStore + ?Sized>(
         _ => return Err(DpopError::MalformedJws),
     };
 
+    // Decode JOSE header (as Value first, to reject private 'd')
     let hdr: DpopHeader = {
         let bytes = B64.decode(h_b64).map_err(|_| DpopError::MalformedJws)?;
-        serde_json::from_slice(&bytes).map_err(|_| DpopError::MalformedJws)?
+        let val: serde_json::Value =
+            serde_json::from_slice(&bytes).map_err(|_| DpopError::MalformedJws)?;
+        // MUST NOT include private JWK material
+        if val.get("jwk").and_then(|j| j.get("d")).is_some() {
+            return Err(DpopError::BadJwk("jwk must not include 'd'"));
+        }
+        serde_json::from_value(val).map_err(|_| DpopError::MalformedJws)?
     };
+
     if hdr.typ != "dpop+jwt" {
         return Err(DpopError::MalformedJws);
     }
@@ -86,9 +94,11 @@ pub async fn verify_proof<S: ReplayStore + ?Sized>(
     };
 
     let sig_bytes = B64.decode(s_b64).map_err(|_| DpopError::InvalidSignature)?;
-    // JOSE requires raw r||s (64 bytes) for ES256. Convert to DER for p256 parser.
-    let der = raw_rs_to_der(&sig_bytes).ok_or(DpopError::InvalidSignature)?;
-    let sig = Signature::from_der(&der).map_err(|_| DpopError::InvalidSignature)?;
+    // JOSE (JWS ES256) requires raw r||s (64 bytes). Do NOT accept DER.
+    if sig_bytes.len() != 64 {
+        return Err(DpopError::InvalidSignature);
+    }
+    let sig = Signature::from_slice(&sig_bytes).map_err(|_| DpopError::InvalidSignature)?;
     vk.verify(signing_input.as_bytes(), &sig)
         .map_err(|_| DpopError::InvalidSignature)?;
 
@@ -177,48 +187,6 @@ fn equal_htu(a: &str, b: &str) -> bool {
         u.split(['?', '#']).next().unwrap_or(u)
     }
     trim(a).eq_ignore_ascii_case(trim(b))
-}
-
-/// Convert JOSE raw r||s (64 bytes) to ASN.1/DER for p256 parser.
-fn raw_rs_to_der(raw: &[u8]) -> Option<Vec<u8>> {
-    if raw.len() != 64 {
-        return None;
-    }
-    let (r, s) = raw.split_at(32);
-
-    fn enc_int(mut v: &[u8]) -> Vec<u8> {
-        while v.len() > 1 && v[0] == 0 {
-            v = &v[1..]; // strip leading zeros
-        }
-        let mut out = v.to_vec();
-        if !out.is_empty() && (out[0] & 0x80) != 0 {
-            let mut z = Vec::with_capacity(out.len() + 1);
-            z.push(0);
-            z.extend_from_slice(&out);
-            out = z;
-        }
-        out
-    }
-
-    let r_enc = enc_int(r);
-    let s_enc = enc_int(s);
-
-    let len = 2 + r_enc.len() + 2 + s_enc.len();
-    let mut der = Vec::with_capacity(2 + len);
-    der.push(0x30);
-    if len < 128 {
-        der.push(len as u8);
-    } else {
-        der.push(0x81);
-        der.push(len as u8);
-    }
-    der.push(0x02);
-    der.push(r_enc.len() as u8);
-    der.extend_from_slice(&r_enc);
-    der.push(0x02);
-    der.push(s_enc.len() as u8);
-    der.extend_from_slice(&s_enc);
-    Some(der)
 }
 
 #[cfg(test)]
