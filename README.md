@@ -1,5 +1,5 @@
 
-# oauth-dpop
+# Dpop Verifier
 
 A tiny DPoP proof verifier for Rust:
 - ES256 over P-256 only (per spec’s MTI)
