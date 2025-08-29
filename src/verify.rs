@@ -1,13 +1,13 @@
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64;
-use jsonwebtoken::{Algorithm, Validation};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use time::OffsetDateTime;
 
 use crate::DpopError;
-use crate::jwk::{decoding_key_from_p256_xy, thumbprint_ec_p256};
+use crate::jwk::{thumbprint_ec_p256, verifying_key_from_p256_xy};
 use crate::replay::{ReplayContext, ReplayStore};
+use p256::ecdsa::{Signature, VerifyingKey, signature::Verifier};
 
 #[derive(Deserialize)]
 struct DpopHeader {
@@ -53,14 +53,14 @@ pub async fn verify_proof<S: ReplayStore + ?Sized>(
     maybe_access_token: Option<&str>,
     opts: VerifyOptions,
 ) -> Result<VerifiedDpop, DpopError> {
-    // Split compact JWS
+    // 1) Split Compact JWS
     let mut it = dpop_compact_jws.split('.');
-    let (h_b64, _p_b64, _s_b64) = match (it.next(), it.next(), it.next()) {
-        (Some(h), Some(_), Some(_)) if it.next().is_none() => (h, (), ()),
+    let (h_b64, p_b64, s_b64) = match (it.next(), it.next(), it.next()) {
+        (Some(h), Some(p), Some(s)) if it.next().is_none() => (h, p, s),
         _ => return Err(DpopError::MalformedJws),
     };
 
-    // Decode JOSE header
+    // 2) Parse JOSE header
     let hdr: DpopHeader = {
         let bytes = B64.decode(h_b64).map_err(|_| DpopError::MalformedJws)?;
         serde_json::from_slice(&bytes).map_err(|_| DpopError::MalformedJws)?
@@ -68,6 +68,7 @@ pub async fn verify_proof<S: ReplayStore + ?Sized>(
     if hdr.typ != "dpop+jwt" {
         return Err(DpopError::MalformedJws);
     }
+    // JOSE algorithm must be ES256 (P-256 + SHA-256)
     if hdr.alg != "ES256" {
         return Err(DpopError::UnsupportedAlg);
     }
@@ -75,30 +76,44 @@ pub async fn verify_proof<S: ReplayStore + ?Sized>(
         return Err(DpopError::BadJwk("expect EC P-256"));
     }
 
-    // Verify signature only (claims checked manually)
-    let key = decoding_key_from_p256_xy(&hdr.jwk.x, &hdr.jwk.y)?;
-    let mut v = Validation::new(Algorithm::ES256);
-    v.validate_exp = false;
-    v.validate_nbf = false;
-    v.validate_aud = false;
-    let data = jsonwebtoken::decode::<serde_json::Value>(dpop_compact_jws, &key, &v)
-        .map_err(|_| DpopError::InvalidSignature)?;
-    let c = &data.claims;
+    // 3) Build verifying key from JWK x/y
+    let vk: VerifyingKey = verifying_key_from_p256_xy(&hdr.jwk.x, &hdr.jwk.y)?;
 
-    // Required claims
-    let jti = c
+    // 4) Verify ECDSA signature over "<header>.<payload>"
+    let signing_input = {
+        let mut s = String::with_capacity(h_b64.len() + 1 + p_b64.len());
+        s.push_str(h_b64);
+        s.push('.');
+        s.push_str(p_b64);
+        s
+    };
+
+    let sig_bytes = B64.decode(s_b64).map_err(|_| DpopError::InvalidSignature)?;
+    // JOSE requires raw r||s (64 bytes) for ES256. Convert to DER for p256 parser.
+    let der = raw_rs_to_der(&sig_bytes).ok_or(DpopError::InvalidSignature)?;
+    let sig = Signature::from_der(&der).map_err(|_| DpopError::InvalidSignature)?;
+    vk.verify(signing_input.as_bytes(), &sig)
+        .map_err(|_| DpopError::InvalidSignature)?;
+
+    // 5) Claims
+    let claims: serde_json::Value = {
+        let bytes = B64.decode(p_b64).map_err(|_| DpopError::MalformedJws)?;
+        serde_json::from_slice(&bytes).map_err(|_| DpopError::MalformedJws)?
+    };
+
+    let jti = claims
         .get("jti")
         .and_then(|v| v.as_str())
         .ok_or(DpopError::MissingClaim("jti"))?;
-    let iat = c
+    let iat = claims
         .get("iat")
         .and_then(|v| v.as_i64())
         .ok_or(DpopError::MissingClaim("iat"))?;
-    let htm = c
+    let htm = claims
         .get("htm")
         .and_then(|v| v.as_str())
         .ok_or(DpopError::MissingClaim("htm"))?;
-    let htu = c
+    let htu = claims
         .get("htu")
         .and_then(|v| v.as_str())
         .ok_or(DpopError::MissingClaim("htu"))?;
@@ -110,10 +125,10 @@ pub async fn verify_proof<S: ReplayStore + ?Sized>(
         return Err(DpopError::HtuMismatch);
     }
 
-    // Optional ath
+    // 6) Optional ath (only when an access token is being presented)
     if let Some(at) = maybe_access_token {
         let want = B64.encode(Sha256::digest(at.as_bytes()));
-        let got = c
+        let got = claims
             .get("ath")
             .and_then(|v| v.as_str())
             .ok_or(DpopError::MissingAth)?;
@@ -122,7 +137,7 @@ pub async fn verify_proof<S: ReplayStore + ?Sized>(
         }
     }
 
-    // Freshness
+    // 7) Freshness (iat)
     let now = OffsetDateTime::now_utc().unix_timestamp();
     if iat > now + opts.future_skew_secs {
         return Err(DpopError::FutureSkew);
@@ -131,7 +146,7 @@ pub async fn verify_proof<S: ReplayStore + ?Sized>(
         return Err(DpopError::Stale);
     }
 
-    // Replay prevention
+    // 8) Replay prevention (store SHA-256(jti))
     let mut hasher = Sha256::new();
     hasher.update(jti.as_bytes());
     let mut jti_hash = [0u8; 32];
@@ -166,6 +181,48 @@ fn equal_htu(a: &str, b: &str) -> bool {
         u.split(['?', '#']).next().unwrap_or(u)
     }
     trim(a).eq_ignore_ascii_case(trim(b))
+}
+
+/// Convert JOSE raw r||s (64 bytes) to ASN.1/DER for p256 parser.
+fn raw_rs_to_der(raw: &[u8]) -> Option<Vec<u8>> {
+    if raw.len() != 64 {
+        return None;
+    }
+    let (r, s) = raw.split_at(32);
+
+    fn enc_int(mut v: &[u8]) -> Vec<u8> {
+        while v.len() > 1 && v[0] == 0 {
+            v = &v[1..]; // strip leading zeros
+        }
+        let mut out = v.to_vec();
+        if !out.is_empty() && (out[0] & 0x80) != 0 {
+            let mut z = Vec::with_capacity(out.len() + 1);
+            z.push(0);
+            z.extend_from_slice(&out);
+            out = z;
+        }
+        out
+    }
+
+    let r_enc = enc_int(r);
+    let s_enc = enc_int(s);
+
+    let len = 2 + r_enc.len() + 2 + s_enc.len();
+    let mut der = Vec::with_capacity(2 + len);
+    der.push(0x30);
+    if len < 128 {
+        der.push(len as u8);
+    } else {
+        der.push(0x81);
+        der.push(len as u8);
+    }
+    der.push(0x02);
+    der.push(r_enc.len() as u8);
+    der.extend_from_slice(&r_enc);
+    der.push(0x02);
+    der.push(s_enc.len() as u8);
+    der.extend_from_slice(&s_enc);
+    Some(der)
 }
 
 #[cfg(test)]
@@ -207,13 +264,13 @@ mod tests {
         // 31-byte x (trimmed), 32-byte y
         let bad_x = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([0u8; 31]);
         let good_y = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([0u8; 32]);
-        let res = crate::jwk::decoding_key_from_p256_xy(&bad_x, &good_y);
-        assert!(res.is_err(), "expected error for bad x");
+        let res = crate::jwk::verifying_key_from_p256_xy(&bad_x, &good_y);
+        assert!(res.is_err(), "expected error for bad y");
 
         // 32-byte x, 33-byte y
         let good_x = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([0u8; 32]);
         let bad_y = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([0u8; 33]);
-        let res = crate::jwk::decoding_key_from_p256_xy(&good_x, &bad_y);
+        let res = crate::jwk::verifying_key_from_p256_xy(&good_x, &bad_y);
         assert!(res.is_err(), "expected error for bad y");
     }
 

@@ -1,36 +1,32 @@
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64;
-use jsonwebtoken::DecodingKey;
-use p256::pkcs8::EncodePublicKey;
+use p256::ecdsa::VerifyingKey;
+use p256::{EncodedPoint, FieldBytes};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 
 use crate::DpopError;
 
-pub fn decoding_key_from_p256_xy(x_b64: &str, y_b64: &str) -> Result<DecodingKey, DpopError> {
+/// Build a P-256 verifying key from JWK x/y (base64url, no padding).
+pub fn verifying_key_from_p256_xy(x_b64: &str, y_b64: &str) -> Result<VerifyingKey, DpopError> {
     let x = B64
-        .decode(x_b64.as_bytes())
-        .map_err(|_| DpopError::BadJwk("bad x"))?;
+        .decode(x_b64)
+        .map_err(|_| DpopError::BadJwk("bad jwk.x"))?;
     let y = B64
-        .decode(y_b64.as_bytes())
-        .map_err(|_| DpopError::BadJwk("bad y"))?;
+        .decode(y_b64)
+        .map_err(|_| DpopError::BadJwk("bad jwk.y"))?;
+
     if x.len() != 32 || y.len() != 32 {
-        return Err(DpopError::BadJwk("x/y must be 32 bytes"));
+        return Err(DpopError::BadJwk("jwk x/y must be 32 bytes"));
     }
 
-    // x,y are 32-byte slices decoded from base64url
-    let mut sec1 = [0u8; 65];
-    sec1[0] = 0x04;
-    sec1[1..33].copy_from_slice(&x);
-    sec1[33..65].copy_from_slice(&y);
+    let point = EncodedPoint::from_affine_coordinates(
+        FieldBytes::from_slice(&x),
+        FieldBytes::from_slice(&y),
+        /* compress = */ false,
+    );
 
-    let pk = p256::PublicKey::from_sec1_bytes(&sec1)
-        .map_err(|_| DpopError::BadJwk("invalid EC point"))?;
-
-    let spki = pk
-        .to_public_key_der()
-        .map_err(|_| DpopError::BadJwk("SPKI encode failed"))?;
-    Ok(jsonwebtoken::DecodingKey::from_ec_der(spki.as_bytes()))
+    VerifyingKey::from_encoded_point(&point).map_err(|_| DpopError::BadJwk("invalid EC point"))
 }
 
 pub fn thumbprint_ec_p256(x_b64: &str, y_b64: &str) -> Result<String, DpopError> {
