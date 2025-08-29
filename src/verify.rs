@@ -53,14 +53,12 @@ pub async fn verify_proof<S: ReplayStore + ?Sized>(
     maybe_access_token: Option<&str>,
     opts: VerifyOptions,
 ) -> Result<VerifiedDpop, DpopError> {
-    // 1) Split Compact JWS
     let mut it = dpop_compact_jws.split('.');
     let (h_b64, p_b64, s_b64) = match (it.next(), it.next(), it.next()) {
         (Some(h), Some(p), Some(s)) if it.next().is_none() => (h, p, s),
         _ => return Err(DpopError::MalformedJws),
     };
 
-    // 2) Parse JOSE header
     let hdr: DpopHeader = {
         let bytes = B64.decode(h_b64).map_err(|_| DpopError::MalformedJws)?;
         serde_json::from_slice(&bytes).map_err(|_| DpopError::MalformedJws)?
@@ -76,10 +74,9 @@ pub async fn verify_proof<S: ReplayStore + ?Sized>(
         return Err(DpopError::BadJwk("expect EC P-256"));
     }
 
-    // 3) Build verifying key from JWK x/y
     let vk: VerifyingKey = verifying_key_from_p256_xy(&hdr.jwk.x, &hdr.jwk.y)?;
 
-    // 4) Verify ECDSA signature over "<header>.<payload>"
+    // Verify ECDSA signature over "<header>.<payload>"
     let signing_input = {
         let mut s = String::with_capacity(h_b64.len() + 1 + p_b64.len());
         s.push_str(h_b64);
@@ -95,7 +92,6 @@ pub async fn verify_proof<S: ReplayStore + ?Sized>(
     vk.verify(signing_input.as_bytes(), &sig)
         .map_err(|_| DpopError::InvalidSignature)?;
 
-    // 5) Claims
     let claims: serde_json::Value = {
         let bytes = B64.decode(p_b64).map_err(|_| DpopError::MalformedJws)?;
         serde_json::from_slice(&bytes).map_err(|_| DpopError::MalformedJws)?
@@ -125,7 +121,7 @@ pub async fn verify_proof<S: ReplayStore + ?Sized>(
         return Err(DpopError::HtuMismatch);
     }
 
-    // 6) Optional ath (only when an access token is being presented)
+    // Optional ath (only when an access token is being presented)
     if let Some(at) = maybe_access_token {
         let want = B64.encode(Sha256::digest(at.as_bytes()));
         let got = claims
@@ -137,7 +133,7 @@ pub async fn verify_proof<S: ReplayStore + ?Sized>(
         }
     }
 
-    // 7) Freshness (iat)
+    // Freshness (iat)
     let now = OffsetDateTime::now_utc().unix_timestamp();
     if iat > now + opts.future_skew_secs {
         return Err(DpopError::FutureSkew);
@@ -146,7 +142,7 @@ pub async fn verify_proof<S: ReplayStore + ?Sized>(
         return Err(DpopError::Stale);
     }
 
-    // 8) Replay prevention (store SHA-256(jti))
+    // Replay prevention (store SHA-256(jti))
     let mut hasher = Sha256::new();
     hasher.update(jti.as_bytes());
     let mut jti_hash = [0u8; 32];
