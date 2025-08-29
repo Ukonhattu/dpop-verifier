@@ -1,0 +1,30 @@
+[package]
+name = "dpop-verifier"
+version = "0.1.0"
+edition = "2024"
+license = "GPLv3"
+description = "Lightweight DPoP proof verifier with pluggable replay store"
+repository = "https://github.com/ukonhattu/dpop-verifier"
+readme = "README.md"
+keywords = ["oauth", "dpop", "oidc", "security", "jwt"]
+categories = ["authentication", "cryptography", "web-programming"]
+
+[features]
+default = []
+actix-web = ["dep:actix-web"]
+
+[dependencies]
+async-trait = "0.1"
+base64 = "0.22"
+jsonwebtoken = { version = "9", default-features = false }
+p256 = { version = "0.13", features = ["pkcs8"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+thiserror = "1"
+time = "0.3"
+
+actix-web = { version = "4", optional = true }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt", "macros"] }
