@@ -2,6 +2,12 @@ use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum DpopError {
+    #[error("Multiple DPoP headers")]
+    MultipleDpopHeaders,
+    #[error("Invalid DPoP header")]
+    InvalidDpopHeader,
+    #[error("Missing DPoP header")]
+    MissingDpopHeader,
     #[error("missing DPoP header")]
     MissingHeader,
     #[error("malformed DPoP JWT")]
