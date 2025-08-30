@@ -35,7 +35,7 @@ use dpop_verifier::{verify_proof, VerifyOptions, ReplayStore, ReplayContext, Dpo
 struct MyStore;
 
 #[async_trait::async_trait]
-impl ReplayStore for MyStore {
+impl ReplayStore for MyStore { // Use your own store like DB or Redis
     async fn insert_once(
         &mut self,
         _jti_hash: [u8; 32],
