@@ -6,7 +6,7 @@ use crate::DpopError;
 
 #[cfg(feature = "actix-web")]
 /// Return the single DPoP header as &str; error if missing or multiple.
-pub fn dpop_header_str<'a>(req: &'a HttpRequest) -> Result<&'a str, DpopError> {
+pub fn dpop_header_str<'a>(req: &'a actix_web::HttpRequest) -> Result<&'a str, DpopError> {
     let mut it = req.headers().get_all("DPoP");
     let first = it.next().ok_or(DpopError::MissingDpopHeader)?;
     if it.next().is_some() {
@@ -52,7 +52,11 @@ pub fn expected_htu_from_actix(req: &actix_web::HttpRequest, trust_proxies: bool
 
     let path = {
         let p = req.uri().path();
-        if p.is_empty() { "/" } else { p }
+        if p.is_empty() {
+            "/"
+        } else {
+            p
+        }
     };
 
     // Drop default ports; otherwise include

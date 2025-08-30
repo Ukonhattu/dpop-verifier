@@ -1,13 +1,20 @@
 [package]
 name = "dpop-verifier"
 version = "0.1.0"
-edition = "2024"
+edition = "2021"
 license = "MIT OR Apache-2.0"
 description = "Lightweight DPoP proof verifier with pluggable replay store"
 repository = "https://github.com/ukonhattu/dpop-verifier"
+homepage = "http://github.com/ukonhattu/dpop-verifier"
+documentation = "https://docs.rs/dpop-verifier"
 readme = "README.md"
 keywords = ["oauth", "dpop", "oidc", "security", "jwt"]
 categories = ["authentication", "cryptography", "web-programming"]
+exclude = [".github/*"]
+
+
+[badges]
+maintained = { status = "actively-developed" }
 
 [features]
 default = []
@@ -29,3 +36,4 @@ actix-web = { version = "4", optional = true }
 [dev-dependencies]
 tokio = { version = "1", features = ["rt", "macros"] }
 rand_core = { version = "0.6", features = ["getrandom"] }
+
