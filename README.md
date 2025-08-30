@@ -16,22 +16,22 @@ oauth-dpop = { git = "https://github.com/ukonhattu/dpop-verifier"}
 ```rust
 use oauth_dpop::{verify_proof, VerifyOptions, ReplayStore, ReplayContext, DpopError};
 
-# struct MyStore;
-# #[async_trait::async_trait]
-# impl ReplayStore for MyStore {
-#   async fn insert_once(&mut self, _jti_hash: [u8;32], _ctx: ReplayContext<'_>) -> Result<bool, DpopError> { Ok(true) }
-# }
+ struct MyStore;
+ #[async_trait::async_trait]
+ impl ReplayStore for MyStore {
+    async fn insert_once(&mut self, _jti_hash: [u8;32], _ctx: ReplayContext<'_>) -> Result<bool, DpopError> { Ok(true) }
+ }
 
-# #[tokio::main]
-# async fn main() -> Result<(), Box<dyn std::error::Error>> {
-let dpop = "..."; // compact JWS from DPoP header
-let expected_htu = "https://example.com/api/token";
-let expected_htm = "POST";
-let mut store = MyStore;
+ #[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let dpop = "..."; // compact JWS from DPoP header
+    let expected_htu = "https://example.com/api/token";
+    let expected_htm = "POST";
+    let mut store = MyStore;
 
 let verified = verify_proof(&mut store, dpop, expected_htu, expected_htm, None, VerifyOptions::default()).await?;
 println!("jkt = {}", verified.jkt);
-# Ok(()) }
+ Ok(()) }
 ```
 
 ## License

@@ -1,6 +1,7 @@
 pub mod error;
 pub mod jwk;
 pub mod replay;
+pub mod uri;
 pub mod verify;
 
 #[cfg(feature = "actix-web")]

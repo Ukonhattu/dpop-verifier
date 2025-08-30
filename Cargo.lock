@@ -471,12 +471,15 @@ dependencies = [
  "async-trait",
  "base64",
  "p256",
+ "rand_core 0.6.4",
  "serde",
  "serde_json",
  "sha2",
+ "subtle",
  "thiserror",
  "time",
  "tokio",
+ "url",
 ]
 
 [[package]]
