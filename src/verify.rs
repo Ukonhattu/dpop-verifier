@@ -1,15 +1,15 @@
 use crate::uri::{normalize_htu, normalize_method};
-use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64;
+use base64::Engine;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 use time::OffsetDateTime;
 
-use crate::DpopError;
 use crate::jwk::{thumbprint_ec_p256, verifying_key_from_p256_xy};
 use crate::replay::{ReplayContext, ReplayStore};
-use p256::ecdsa::{Signature, VerifyingKey, signature::Verifier};
+use crate::DpopError;
+use p256::ecdsa::{signature::Verifier, Signature, VerifyingKey};
 
 #[derive(Deserialize)]
 struct DpopHeader {
@@ -25,16 +25,34 @@ struct Jwk {
     y: String,
 }
 
+#[derive(Clone, Debug)]
+pub enum NonceMode {
+    Disabled,
+    /// Require exact equality against `expected_nonce`
+    RequireEqual {
+        expected_nonce: String, // the nonce you previously issued
+    },
+    /// Stateless HMAC-based nonces: encode ts+rand+ctx and MAC it
+    Hmac {
+        secret: std::sync::Arc<[u8]>, // server secret
+        max_age_secs: i64,            // window (e.g., 300)
+        bind_htu_htm: bool,
+        bind_jkt: bool,
+    },
+}
+
 #[derive(Debug, Clone)]
 pub struct VerifyOptions {
     pub max_age_secs: i64,
     pub future_skew_secs: i64,
+    pub nonce_mode: NonceMode,
 }
 impl Default for VerifyOptions {
     fn default() -> Self {
         Self {
             max_age_secs: 300,
             future_skew_secs: 5,
+            nonce_mode: NonceMode::Disabled,
         }
     }
 }
@@ -181,6 +199,68 @@ pub async fn verify_proof<S: ReplayStore + ?Sized>(
     jti_hash.copy_from_slice(&hasher.finalize());
 
     let jkt = thumbprint_ec_p256(&hdr.jwk.x, &hdr.jwk.y)?;
+
+    let nonce_claim = claims.get("nonce").and_then(|v| v.as_str());
+
+    match &opts.nonce_mode {
+        NonceMode::Disabled => { /* do nothing */ }
+        NonceMode::RequireEqual { expected_nonce } => {
+            let n = nonce_claim.ok_or(DpopError::MissingNonce)?;
+            if n != expected_nonce {
+                let fresh = expected_nonce.to_string(); // or issue a new one if you prefer
+                return Err(DpopError::UseDpopNonce { nonce: fresh });
+            }
+        }
+        NonceMode::Hmac {
+            secret,
+            max_age_secs,
+            bind_htu_htm,
+            bind_jkt,
+        } => {
+            let n = match nonce_claim {
+                Some(s) => s,
+                None => {
+                    // Missing → ask client to retry with nonce
+                    let now = time::OffsetDateTime::now_utc().unix_timestamp();
+                    let ctx = crate::nonce::NonceCtx {
+                        htu: if *bind_htu_htm {
+                            Some(want_htu.as_str())
+                        } else {
+                            None
+                        },
+                        htm: if *bind_htu_htm {
+                            Some(want_htm.as_str())
+                        } else {
+                            None
+                        },
+                        jkt: if *bind_jkt { Some(jkt.as_str()) } else { None },
+                    };
+                    let fresh = crate::nonce::issue_nonce(secret, now, &ctx);
+                    return Err(DpopError::UseDpopNonce { nonce: fresh });
+                }
+            };
+            let now = time::OffsetDateTime::now_utc().unix_timestamp();
+            let ctx = crate::nonce::NonceCtx {
+                htu: if *bind_htu_htm {
+                    Some(want_htu.as_str())
+                } else {
+                    None
+                },
+                htm: if *bind_htu_htm {
+                    Some(want_htm.as_str())
+                } else {
+                    None
+                },
+                jkt: if *bind_jkt { Some(jkt.as_str()) } else { None },
+            };
+            if let Err(_) = crate::nonce::verify_nonce(secret, n, now, *max_age_secs, &ctx) {
+                // On invalid/stale → emit NEW nonce so client can retry immediately
+                let fresh = crate::nonce::issue_nonce(secret, now, &ctx);
+                return Err(DpopError::UseDpopNonce { nonce: fresh });
+            }
+        }
+    }
+
     let ok = store
         .insert_once(
             jti_hash,
@@ -207,8 +287,10 @@ pub async fn verify_proof<S: ReplayStore + ?Sized>(
 mod tests {
     use super::*;
     use crate::jwk::thumbprint_ec_p256;
-    use p256::ecdsa::{Signature, SigningKey, signature::Signer};
+    use crate::nonce::issue_nonce;
+    use p256::ecdsa::{signature::Signer, Signature, SigningKey};
     use rand_core::OsRng;
+    use std::sync::Arc;
 
     // ---- helpers ----------------------------------------------------------------
 
@@ -354,18 +436,16 @@ mod tests {
         let jws = make_jws(&sk, h, p);
 
         let mut store = MemoryStore::default();
-        assert!(
-            verify_proof(
-                &mut store,
-                &jws,
-                "https://ex.com/a",
-                "GET",
-                None,
-                VerifyOptions::default()
-            )
-            .await
-            .is_ok()
-        );
+        assert!(verify_proof(
+            &mut store,
+            &jws,
+            "https://ex.com/a",
+            "GET",
+            None,
+            VerifyOptions::default()
+        )
+        .await
+        .is_ok());
     }
 
     #[tokio::test]
@@ -380,18 +460,16 @@ mod tests {
         let jws = make_jws(&sk, h, p);
 
         let mut store = MemoryStore::default();
-        assert!(
-            verify_proof(
-                &mut store,
-                &jws,
-                expect_htu,
-                "GET",
-                None,
-                VerifyOptions::default()
-            )
-            .await
-            .is_ok()
-        );
+        assert!(verify_proof(
+            &mut store,
+            &jws,
+            expect_htu,
+            "GET",
+            None,
+            VerifyOptions::default()
+        )
+        .await
+        .is_ok());
     }
 
     #[tokio::test]
@@ -496,18 +574,16 @@ mod tests {
         let p_ok = serde_json::json!({"jti":"j8","iat":now,"htm":"GET","htu":"https://ex.com/a","ath":ath});
         let jws_ok = make_jws(&sk, h.clone(), p_ok);
         let mut store = MemoryStore::default();
-        assert!(
-            verify_proof(
-                &mut store,
-                &jws_ok,
-                "https://ex.com/a",
-                "GET",
-                Some(at),
-                VerifyOptions::default()
-            )
-            .await
-            .is_ok()
-        );
+        assert!(verify_proof(
+            &mut store,
+            &jws_ok,
+            "https://ex.com/a",
+            "GET",
+            Some(at),
+            VerifyOptions::default()
+        )
+        .await
+        .is_ok());
 
         // Mismatch
         let p_bad = serde_json::json!({"jti":"j9","iat":now,"htm":"GET","htu":"https://ex.com/a","ath":ath});
@@ -557,6 +633,7 @@ mod tests {
         let opts = VerifyOptions {
             max_age_secs: 300,
             future_skew_secs: 5,
+            nonce_mode: NonceMode::Disabled,
         };
         let err = verify_proof(
             &mut store1,
@@ -578,6 +655,7 @@ mod tests {
         let opts = VerifyOptions {
             max_age_secs: 300,
             future_skew_secs: 5,
+            nonce_mode: NonceMode::Disabled,
         };
         let err = verify_proof(
             &mut store2,
@@ -634,7 +712,7 @@ mod tests {
 
         // Flip one byte in the payload section (keep base64url valid length)
         let bytes = unsafe { jws.as_bytes_mut() }; // alternative: rebuild string
-        // Find the second '.' and flip a safe ASCII char before it
+                                                   // Find the second '.' and flip a safe ASCII char before it
         let mut dot_count = 0usize;
         for i in 0..bytes.len() {
             if bytes[i] == b'.' {
@@ -714,5 +792,376 @@ mod tests {
         .await
         .unwrap_err();
         matches!(err, DpopError::JtiTooLong);
+    }
+    // ----------------------- Nonce: RequireEqual -------------------------------
+
+    #[tokio::test]
+    async fn nonce_require_equal_ok() {
+        let (sk, x, y) = gen_es256_key();
+        let now = OffsetDateTime::now_utc().unix_timestamp();
+        let expected_htu = "https://ex.com/a";
+        let expected_htm = "GET";
+
+        let expected_nonce = "nonce-123";
+        let h = serde_json::json!({"typ":"dpop+jwt","alg":"ES256","jwk":{"kty":"EC","crv":"P-256","x":x,"y":y}});
+        let p = serde_json::json!({
+            "jti":"n-reqeq-ok",
+            "iat":now,
+            "htm":expected_htm,
+            "htu":expected_htu,
+            "nonce": expected_nonce
+        });
+        let jws = make_jws(&sk, h, p);
+
+        let mut store = MemoryStore::default();
+        let opts = VerifyOptions {
+            max_age_secs: 300,
+            future_skew_secs: 5,
+            nonce_mode: NonceMode::RequireEqual {
+                expected_nonce: expected_nonce.to_string(),
+            },
+        };
+        assert!(
+            verify_proof(&mut store, &jws, expected_htu, expected_htm, None, opts)
+                .await
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn nonce_require_equal_missing_claim() {
+        let (sk, x, y) = gen_es256_key();
+        let now = OffsetDateTime::now_utc().unix_timestamp();
+        let expected_htu = "https://ex.com/a";
+        let expected_htm = "GET";
+
+        let h = serde_json::json!({"typ":"dpop+jwt","alg":"ES256","jwk":{"kty":"EC","crv":"P-256","x":x,"y":y}});
+        let p = serde_json::json!({
+            "jti":"n-reqeq-miss",
+            "iat":now,
+            "htm":expected_htm,
+            "htu":expected_htu
+        });
+        let jws = make_jws(&sk, h, p);
+
+        let mut store = MemoryStore::default();
+        let opts = VerifyOptions {
+            max_age_secs: 300,
+            future_skew_secs: 5,
+            nonce_mode: NonceMode::RequireEqual {
+                expected_nonce: "x".into(),
+            },
+        };
+        let err = verify_proof(&mut store, &jws, expected_htu, expected_htm, None, opts)
+            .await
+            .unwrap_err();
+        matches!(err, DpopError::MissingNonce);
+    }
+
+    #[tokio::test]
+    async fn nonce_require_equal_mismatch_yields_usedpopnonce() {
+        let (sk, x, y) = gen_es256_key();
+        let now = OffsetDateTime::now_utc().unix_timestamp();
+        let expected_htu = "https://ex.com/a";
+        let expected_htm = "GET";
+
+        let claim_nonce = "client-value";
+        let expected_nonce = "server-expected";
+        let h = serde_json::json!({"typ":"dpop+jwt","alg":"ES256","jwk":{"kty":"EC","crv":"P-256","x":x,"y":y}});
+        let p = serde_json::json!({
+            "jti":"n-reqeq-mis",
+            "iat":now,
+            "htm":expected_htm,
+            "htu":expected_htu,
+            "nonce": claim_nonce
+        });
+        let jws = make_jws(&sk, h, p);
+
+        let mut store = MemoryStore::default();
+        let opts = VerifyOptions {
+            max_age_secs: 300,
+            future_skew_secs: 5,
+            nonce_mode: NonceMode::RequireEqual {
+                expected_nonce: expected_nonce.into(),
+            },
+        };
+        let err = verify_proof(&mut store, &jws, expected_htu, expected_htm, None, opts)
+            .await
+            .unwrap_err();
+        // Server should respond with UseDpopNonce carrying a fresh/expected nonce
+        if let DpopError::UseDpopNonce { nonce } = err {
+            assert_eq!(nonce, expected_nonce);
+        } else {
+            panic!("expected UseDpopNonce, got {err:?}");
+        }
+    }
+
+    // -------------------------- Nonce: HMAC ------------------------------------
+
+    #[tokio::test]
+    async fn nonce_hmac_ok_bound_all() {
+        let (sk, x, y) = gen_es256_key();
+        let now = OffsetDateTime::now_utc().unix_timestamp();
+        let expected_htu = "https://ex.com/a";
+        let expected_htm = "GET";
+
+        // Compute jkt from header jwk x/y to match verifier's jkt
+        let jkt = thumbprint_ec_p256(&x, &y).unwrap();
+
+        let secret: Arc<[u8]> = Arc::from(&b"supersecret"[..]);
+        let ctx = crate::nonce::NonceCtx {
+            htu: Some(expected_htu),
+            htm: Some(expected_htm),
+            jkt: Some(&jkt),
+        };
+        let nonce = issue_nonce(&secret, now, &ctx);
+
+        let h = serde_json::json!({"typ":"dpop+jwt","alg":"ES256","jwk":{"kty":"EC","crv":"P-256","x":x,"y":y}});
+        let p = serde_json::json!({
+            "jti":"n-hmac-ok",
+            "iat":now,
+            "htm":expected_htm,
+            "htu":expected_htu,
+            "nonce": nonce
+        });
+        let jws = make_jws(&sk, h, p);
+
+        let mut store = MemoryStore::default();
+        let opts = VerifyOptions {
+            max_age_secs: 300,
+            future_skew_secs: 5,
+            nonce_mode: NonceMode::Hmac {
+                secret: secret.clone(),
+                max_age_secs: 300,
+                bind_htu_htm: true,
+                bind_jkt: true,
+            },
+        };
+        assert!(
+            verify_proof(&mut store, &jws, expected_htu, expected_htm, None, opts)
+                .await
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn nonce_hmac_missing_claim_prompts_use_dpop_nonce() {
+        let (sk, x, y) = gen_es256_key();
+        let now = OffsetDateTime::now_utc().unix_timestamp();
+        let expected_htu = "https://ex.com/a";
+        let expected_htm = "GET";
+
+        let secret: Arc<[u8]> = Arc::from(&b"supersecret"[..]);
+
+        let h = serde_json::json!({"typ":"dpop+jwt","alg":"ES256","jwk":{"kty":"EC","crv":"P-256","x":x,"y":y}});
+        let p = serde_json::json!({
+            "jti":"n-hmac-miss",
+            "iat":now,
+            "htm":expected_htm,
+            "htu":expected_htu
+        });
+        let jws = make_jws(&sk, h, p);
+
+        let mut store = MemoryStore::default();
+        let opts = VerifyOptions {
+            max_age_secs: 300,
+            future_skew_secs: 5,
+            nonce_mode: NonceMode::Hmac {
+                secret: secret.clone(),
+                max_age_secs: 300,
+                bind_htu_htm: true,
+                bind_jkt: true,
+            },
+        };
+        let err = verify_proof(&mut store, &jws, expected_htu, expected_htm, None, opts)
+            .await
+            .unwrap_err();
+        matches!(err, DpopError::UseDpopNonce { .. });
+    }
+
+    #[tokio::test]
+    async fn nonce_hmac_wrong_htu_prompts_use_dpop_nonce() {
+        let (sk, x, y) = gen_es256_key();
+        let now = OffsetDateTime::now_utc().unix_timestamp();
+        let expected_htm = "GET";
+        let expected_htu = "https://ex.com/correct";
+
+        // Bind nonce to a different HTU to force mismatch
+        let jkt = thumbprint_ec_p256(&x, &y).unwrap();
+        let secret: Arc<[u8]> = Arc::from(&b"k"[..]);
+        let ctx_wrong = crate::nonce::NonceCtx {
+            htu: Some("https://ex.com/wrong"),
+            htm: Some(expected_htm),
+            jkt: Some(&jkt),
+        };
+        let nonce = issue_nonce(&secret, now, &ctx_wrong);
+
+        let h = serde_json::json!({"typ":"dpop+jwt","alg":"ES256","jwk":{"kty":"EC","crv":"P-256","x":x,"y":y}});
+        let p = serde_json::json!({
+            "jti":"n-hmac-htu-mis",
+            "iat":now,
+            "htm":expected_htm,
+            "htu":expected_htu,
+            "nonce": nonce
+        });
+        let jws = make_jws(&sk, h, p);
+
+        let mut store = MemoryStore::default();
+        let opts = VerifyOptions {
+            max_age_secs: 300,
+            future_skew_secs: 5,
+            nonce_mode: NonceMode::Hmac {
+                secret: secret.clone(),
+                max_age_secs: 300,
+                bind_htu_htm: true,
+                bind_jkt: true,
+            },
+        };
+        let err = verify_proof(&mut store, &jws, expected_htu, expected_htm, None, opts)
+            .await
+            .unwrap_err();
+        matches!(err, DpopError::UseDpopNonce { .. });
+    }
+
+    #[tokio::test]
+    async fn nonce_hmac_wrong_jkt_prompts_use_dpop_nonce() {
+        // Create two keys; mint nonce with jkt from key A, but sign proof with key B
+        let (_sk_a, x_a, y_a) = gen_es256_key();
+        let (sk_b, x_b, y_b) = gen_es256_key();
+        let now = OffsetDateTime::now_utc().unix_timestamp();
+        let expected_htu = "https://ex.com/a";
+        let expected_htm = "GET";
+
+        let jkt_a = thumbprint_ec_p256(&x_a, &y_a).unwrap();
+        let secret: Arc<[u8]> = Arc::from(&b"secret-2"[..]);
+        let ctx = crate::nonce::NonceCtx {
+            htu: Some(expected_htu),
+            htm: Some(expected_htm),
+            jkt: Some(&jkt_a), // bind nonce to A's jkt
+        };
+        let nonce = issue_nonce(&secret, now, &ctx);
+
+        // Build proof with key B (=> jkt != jkt_a)
+        let h = serde_json::json!({"typ":"dpop+jwt","alg":"ES256","jwk":{"kty":"EC","crv":"P-256","x":x_b,"y":y_b}});
+        let p = serde_json::json!({
+            "jti":"n-hmac-jkt-mis",
+            "iat":now,
+            "htm":expected_htm,
+            "htu":expected_htu,
+            "nonce": nonce
+        });
+        let jws = make_jws(&sk_b, h, p);
+
+        let mut store = MemoryStore::default();
+        let opts = VerifyOptions {
+            max_age_secs: 300,
+            future_skew_secs: 5,
+            nonce_mode: NonceMode::Hmac {
+                secret: secret.clone(),
+                max_age_secs: 300,
+                bind_htu_htm: true,
+                bind_jkt: true,
+            },
+        };
+        let err = verify_proof(&mut store, &jws, expected_htu, expected_htm, None, opts)
+            .await
+            .unwrap_err();
+        matches!(err, DpopError::UseDpopNonce { .. });
+    }
+
+    #[tokio::test]
+    async fn nonce_hmac_stale_prompts_use_dpop_nonce() {
+        let (sk, x, y) = gen_es256_key();
+        let now = OffsetDateTime::now_utc().unix_timestamp();
+        let expected_htu = "https://ex.com/a";
+        let expected_htm = "GET";
+
+        let jkt = thumbprint_ec_p256(&x, &y).unwrap();
+        let secret: Arc<[u8]> = Arc::from(&b"secret-3"[..]);
+        // Issue with ts older than max_age
+        let issued_ts = now - 400;
+        let nonce = issue_nonce(
+            &secret,
+            issued_ts,
+            &crate::nonce::NonceCtx {
+                htu: Some(expected_htu),
+                htm: Some(expected_htm),
+                jkt: Some(&jkt),
+            },
+        );
+
+        let h = serde_json::json!({"typ":"dpop+jwt","alg":"ES256","jwk":{"kty":"EC","crv":"P-256","x":x,"y":y}});
+        let p = serde_json::json!({
+            "jti":"n-hmac-stale",
+            "iat":now,
+            "htm":expected_htm,
+            "htu":expected_htu,
+            "nonce": nonce
+        });
+        let jws = make_jws(&sk, h, p);
+
+        let mut store = MemoryStore::default();
+        let opts = VerifyOptions {
+            max_age_secs: 300,
+            future_skew_secs: 5,
+            nonce_mode: NonceMode::Hmac {
+                secret: secret.clone(),
+                max_age_secs: 300,
+                bind_htu_htm: true,
+                bind_jkt: true,
+            },
+        };
+        let err = verify_proof(&mut store, &jws, expected_htu, expected_htm, None, opts)
+            .await
+            .unwrap_err();
+        matches!(err, DpopError::UseDpopNonce { .. });
+    }
+
+    #[tokio::test]
+    async fn nonce_hmac_future_skew_prompts_use_dpop_nonce() {
+        let (sk, x, y) = gen_es256_key();
+        let now = OffsetDateTime::now_utc().unix_timestamp();
+        let expected_htu = "https://ex.com/a";
+        let expected_htm = "GET";
+
+        let jkt = thumbprint_ec_p256(&x, &y).unwrap();
+        let secret: Arc<[u8]> = Arc::from(&b"secret-4"[..]);
+        // Issue with ts in the future beyond 5s tolerance
+        let issued_ts = now + 10;
+        let nonce = issue_nonce(
+            &secret,
+            issued_ts,
+            &crate::nonce::NonceCtx {
+                htu: Some(expected_htu),
+                htm: Some(expected_htm),
+                jkt: Some(&jkt),
+            },
+        );
+
+        let h = serde_json::json!({"typ":"dpop+jwt","alg":"ES256","jwk":{"kty":"EC","crv":"P-256","x":x,"y":y}});
+        let p = serde_json::json!({
+            "jti":"n-hmac-future",
+            "iat":now,
+            "htm":expected_htm,
+            "htu":expected_htu,
+            "nonce": nonce
+        });
+        let jws = make_jws(&sk, h, p);
+
+        let mut store = MemoryStore::default();
+        let opts = VerifyOptions {
+            max_age_secs: 300,
+            future_skew_secs: 5,
+            nonce_mode: NonceMode::Hmac {
+                secret: secret.clone(),
+                max_age_secs: 300,
+                bind_htu_htm: true,
+                bind_jkt: true,
+            },
+        };
+        let err = verify_proof(&mut store, &jws, expected_htu, expected_htm, None, opts)
+            .await
+            .unwrap_err();
+        matches!(err, DpopError::UseDpopNonce { .. });
     }
 }

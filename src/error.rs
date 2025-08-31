@@ -46,4 +46,12 @@ pub enum DpopError {
     Store(Box<dyn std::error::Error + Send + Sync>),
     #[error("Jti too long")]
     JtiTooLong,
+    #[error("Use Dpop nonce")]
+    UseDpopNonce { nonce: String },
+    #[error("Missing Nonce")]
+    MissingNonce,
+    #[error("Nonce mismatch")]
+    NonceMismatch,
+    #[error("Nonce is stale")]
+    NonceStale,
 }

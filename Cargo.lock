@@ -470,6 +470,7 @@ dependencies = [
  "actix-web",
  "async-trait",
  "base64",
+ "hmac",
  "p256",
  "rand_core 0.6.4",
  "serde",
