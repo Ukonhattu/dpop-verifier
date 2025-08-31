@@ -178,7 +178,7 @@ pub async fn verify_proof<S: ReplayStore + ?Sized>(
             .decode(got_b64.as_bytes())
             .map_err(|_| DpopError::AthMalformed)?;
         // Constant-time compare of raw digests:
-        if got.len() != want.len() || bool::from(got.ct_eq(&want[..])) == false {
+        if got.len() != want.len() || !bool::from(got.ct_eq(&want[..])) {
             return Err(DpopError::AthMismatch);
         }
     }

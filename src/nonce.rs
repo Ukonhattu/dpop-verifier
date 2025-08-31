@@ -64,7 +64,7 @@ pub fn issue_nonce(secret: &[u8], now_unix: i64, ctx: &NonceCtx<'_>) -> String {
     mac.update(&ver);
     mac.update(&ts);
     mac.update(&rand);
-    mac.update(&ctx_bytes(&ctx));
+    mac.update(&ctx_bytes(ctx));
     let tag = mac.finalize().into_bytes();
 
     let mut out = Vec::with_capacity(1 + 8 + RAND_LEN + MAC_LEN);
@@ -118,7 +118,7 @@ pub fn verify_nonce(
     mac.update(&[ver]);
     mac.update(&ts.to_be_bytes());
     mac.update(rand);
-    mac.update(&ctx_bytes(&ctx));
+    mac.update(&ctx_bytes(ctx));
     let tag = mac.finalize().into_bytes();
 
     if bool::from(mac_in.ct_eq(&tag[..MAC_LEN])) {
