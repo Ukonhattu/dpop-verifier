@@ -6,13 +6,21 @@ use crate::DpopError;
 
 #[cfg(feature = "actix-web")]
 /// Return the single DPoP header as &str; error if missing or multiple.
-pub fn dpop_header_str<'a>(req: &'a actix_web::HttpRequest) -> Result<&'a str, DpopError> {
+pub fn dpop_header_str<'a>(req: &'a HttpRequest) -> Result<&'a str, DpopError> {
+    // Reject more than one header field
     let mut it = req.headers().get_all("DPoP");
-    let first = it.next().ok_or(DpopError::MissingDpopHeader)?;
+    let first = it.next().ok_or(DpopError::MalformedJws)?;
     if it.next().is_some() {
-        return Err(DpopError::MultipleDpopHeaders);
+        return Err(DpopError::MalformedJws);
     }
-    first.to_str().map_err(|_| DpopError::InvalidDpopHeader)
+
+    // Parse the single header field as a single token68-like value (compact JWS),
+    // not a comma-separated list. Also reject padding and whitespace.
+    let s = first.to_str().map_err(|_| DpopError::MalformedJws)?;
+    if s.contains(',') || s.contains(' ') || s.contains('\t') || s.contains('=') {
+        return Err(DpopError::MalformedJws);
+    }
+    Ok(s)
 }
 
 #[cfg(feature = "actix-web")]
@@ -75,6 +83,7 @@ pub fn expected_htu_from_actix(req: &actix_web::HttpRequest, trust_proxies: bool
 mod actix_helper_tests {
     use super::{dpop_header_str, expected_htu_from_actix};
     use actix_web::test;
+    use actix_web::test::TestRequest;
 
     // ---- dpop_header_str ------------------------------------------------------
 
@@ -92,22 +101,42 @@ mod actix_helper_tests {
         assert!(dpop_header_str(&req).is_err());
     }
 
-    #[actix_web::test]
+    #[test]
     async fn dpop_header_multiple() {
-        let req = test::TestRequest::default()
-            .insert_header(("DPoP", "1.2.3"))
-            .insert_header(("DPoP", "4.5.6"))
+        // Multiple header fields -> must be rejected
+        let req = TestRequest::default()
+            .append_header(("DPoP", "v1.header.payload")) // dummy token-ish
+            .append_header(("DPoP", "v2.header.payload"))
             .to_http_request();
         assert!(dpop_header_str(&req).is_err());
     }
 
-    #[actix_web::test]
-    async fn dpop_header_non_ascii() {
-        // \u{007F} is DEL, invalid in HTTP header values as ASCII text
-        let req = test::TestRequest::default()
-            .insert_header(("DPoP", "\u{007F}"))
+    #[test]
+    async fn dpop_header_single_field_comma_list_rejected() {
+        // Single field with comma-separated values -> must be rejected
+        let req = TestRequest::default()
+            .insert_header(("DPoP", "a.b.c,d.e.f"))
             .to_http_request();
         assert!(dpop_header_str(&req).is_err());
+    }
+
+    #[test]
+    async fn dpop_header_invalid_token68_ascii() {
+        // Padding '=' is not allowed in base64url(no-pad) segments, and spaces are illegal.
+        let req = TestRequest::default()
+            .insert_header(("DPoP", "abc==")) // ASCII, but invalid for our rules
+            .to_http_request();
+        assert!(dpop_header_str(&req).is_err());
+
+        let req2 = TestRequest::default()
+            .insert_header(("DPoP", "abc def")) // space
+            .to_http_request();
+        assert!(dpop_header_str(&req2).is_err());
+
+        let req3 = TestRequest::default()
+            .insert_header(("DPoP", "abc,def")) // comma (list)
+            .to_http_request();
+        assert!(dpop_header_str(&req3).is_err());
     }
 
     // ---- expected_htu_from_actix --------------------------------------------
