@@ -16,7 +16,7 @@ Made this small crate for my own needs. If you feel it's lacking or is missing s
 Crates.io
 ```toml
 [dependencies]
-dpop-verifier = { version = "0.2.1", features = ["actix-web" ] }
+dpop-verifier = { version = "1.0.0", features = ["actix-web", "edssa" ] }
 ```
 
 Git 
