@@ -9,7 +9,7 @@ use time::OffsetDateTime;
 use crate::jwk::{thumbprint_ec_p256, verifying_key_from_p256_xy};
 use crate::replay::{ReplayContext, ReplayStore};
 use crate::DpopError;
-use p256::ecdsa::{signature::Verifier, Signature, VerifyingKey};
+use p256::ecdsa::{signature::Verifier, VerifyingKey};
 
 #[derive(Deserialize)]
 struct DpopHeader {
@@ -17,12 +17,18 @@ struct DpopHeader {
     alg: String,
     jwk: Jwk,
 }
+
 #[derive(Deserialize)]
-struct Jwk {
-    kty: String,
-    crv: String,
-    x: String,
-    y: String,
+#[serde(untagged)]
+enum Jwk {
+    EcP256 {
+        kty: String,
+        crv: String,
+        x: String,
+        y: String,
+    },
+    #[cfg(feature = "eddsa")]
+    OkpEd25519 { kty: String, crv: String, x: String },
 }
 
 #[derive(Clone, Debug)]
@@ -91,25 +97,11 @@ pub async fn verify_proof<S: ReplayStore + ?Sized>(
         serde_json::from_value(val).map_err(|_| DpopError::MalformedJws)?
     };
 
+    // After you parsed `hdr` and blocked private 'd'
     if hdr.typ != "dpop+jwt" {
         return Err(DpopError::MalformedJws);
     }
-    // JOSE algorithm must be ES256 (P-256 + SHA-256)
 
-    match hdr.alg.as_str() {
-        "ES256" => { /* ok */ }
-        // "EdDSA" if cfg!(feature = "eddsa") => { /* ok */ } <-- Will maybe add later
-        "none" => return Err(DpopError::InvalidAlg("none".into())),
-        a if a.starts_with("HS") => return Err(DpopError::InvalidAlg(a.into())),
-        other => return Err(DpopError::UnsupportedAlg(other.into())),
-    }
-    if hdr.jwk.kty != "EC" || hdr.jwk.crv != "P-256" {
-        return Err(DpopError::BadJwk("expect EC P-256"));
-    }
-
-    let vk: VerifyingKey = verifying_key_from_p256_xy(&hdr.jwk.x, &hdr.jwk.y)?;
-
-    // Verify ECDSA signature over "<header>.<payload>"
     let signing_input = {
         let mut s = String::with_capacity(h_b64.len() + 1 + p_b64.len());
         s.push_str(h_b64);
@@ -117,15 +109,40 @@ pub async fn verify_proof<S: ReplayStore + ?Sized>(
         s.push_str(p_b64);
         s
     };
-
     let sig_bytes = B64.decode(s_b64).map_err(|_| DpopError::InvalidSignature)?;
-    // JOSE (JWS ES256) requires raw r||s (64 bytes). Do NOT accept DER.
     if sig_bytes.len() != 64 {
         return Err(DpopError::InvalidSignature);
     }
-    let sig = Signature::from_slice(&sig_bytes).map_err(|_| DpopError::InvalidSignature)?;
-    vk.verify(signing_input.as_bytes(), &sig)
-        .map_err(|_| DpopError::InvalidSignature)?;
+
+    let jkt = match (hdr.alg.as_str(), &hdr.jwk) {
+        ("ES256", Jwk::EcP256 { kty, crv, x, y }) if kty == "EC" && crv == "P-256" => {
+            let vk: VerifyingKey = verifying_key_from_p256_xy(x, y)?;
+            let sig = p256::ecdsa::Signature::from_slice(&sig_bytes)
+                .map_err(|_| DpopError::InvalidSignature)?;
+            vk.verify(signing_input.as_bytes(), &sig)
+                .map_err(|_| DpopError::InvalidSignature)?;
+            // compute EC thumbprint
+            thumbprint_ec_p256(x, y)?
+        }
+
+        #[cfg(feature = "eddsa")]
+        ("EdDSA", Jwk::OkpEd25519 { kty, crv, x }) if kty == "OKP" && crv == "Ed25519" => {
+            use ed25519_dalek::{Signature as EdSig, VerifyingKey as EdVk};
+            use signature::Verifier as _;
+
+            let vk: EdVk = crate::jwk::verifying_key_from_okp_ed25519(x)?;
+            let sig = EdSig::from_slice(&sig_bytes).map_err(|_| DpopError::InvalidSignature)?;
+            vk.verify(signing_input.as_bytes(), &sig)
+                .map_err(|_| DpopError::InvalidSignature)?;
+            crate::jwk::thumbprint_okp_ed25519(x)?
+        }
+
+        ("EdDSA", _) => return Err(DpopError::BadJwk("expect OKP/Ed25519 for EdDSA")),
+        ("ES256", _) => return Err(DpopError::BadJwk("expect EC/P-256 for ES256")),
+        ("none", _) => return Err(DpopError::InvalidAlg("none".into())),
+        (a, _) if a.starts_with("HS") => return Err(DpopError::InvalidAlg(a.into())),
+        (other, _) => return Err(DpopError::UnsupportedAlg(other.into())),
+    };
 
     let claims: serde_json::Value = {
         let bytes = B64.decode(p_b64).map_err(|_| DpopError::MalformedJws)?;
@@ -197,8 +214,6 @@ pub async fn verify_proof<S: ReplayStore + ?Sized>(
     hasher.update(jti.as_bytes());
     let mut jti_hash = [0u8; 32];
     jti_hash.copy_from_slice(&hasher.finalize());
-
-    let jkt = thumbprint_ec_p256(&hdr.jwk.x, &hdr.jwk.y)?;
 
     let nonce_claim = claims.get("nonce").and_then(|v| v.as_str());
 
@@ -1163,5 +1178,105 @@ mod tests {
             .await
             .unwrap_err();
         matches!(err, DpopError::UseDpopNonce { .. });
+    }
+
+    #[cfg(feature = "eddsa")]
+    mod eddsa_tests {
+        use super::*;
+        use ed25519_dalek::Signer;
+        use ed25519_dalek::{Signature as EdSig, SigningKey as EdSk, VerifyingKey as EdVk};
+        use rand_core::OsRng;
+
+        fn gen_ed25519() -> (EdSk, String) {
+            let sk = EdSk::generate(&mut OsRng);
+            let vk = EdVk::from(&sk);
+            let x_b64 = B64.encode(vk.as_bytes()); // 32-byte public key
+            (sk, x_b64)
+        }
+
+        fn make_jws_ed(sk: &EdSk, header: serde_json::Value, claims: serde_json::Value) -> String {
+            let h = serde_json::to_vec(&header).unwrap();
+            let p = serde_json::to_vec(&claims).unwrap();
+            let h_b64 = B64.encode(h);
+            let p_b64 = B64.encode(p);
+            let signing_input = format!("{h_b64}.{p_b64}");
+            let sig: EdSig = sk.sign(signing_input.as_bytes());
+            let s_b64 = B64.encode(sig.to_bytes());
+            format!("{h_b64}.{p_b64}.{s_b64}")
+        }
+
+        #[tokio::test]
+        async fn verify_valid_eddsa_proof() {
+            let (sk, x) = gen_ed25519();
+            let now = OffsetDateTime::now_utc().unix_timestamp();
+            let h = serde_json::json!({"typ":"dpop+jwt","alg":"EdDSA","jwk":{"kty":"OKP","crv":"Ed25519","x":x}});
+            let p =
+                serde_json::json!({"jti":"ed-ok","iat":now,"htm":"GET","htu":"https://ex.com/a"});
+            let jws = make_jws_ed(&sk, h, p);
+
+            let mut store = super::MemoryStore::default();
+            assert!(verify_proof(
+                &mut store,
+                &jws,
+                "https://ex.com/a",
+                "GET",
+                None,
+                VerifyOptions::default(),
+            )
+            .await
+            .is_ok());
+        }
+
+        #[tokio::test]
+        async fn eddsa_wrong_jwk_type_rejected() {
+            let (sk, x) = gen_ed25519();
+            let now = OffsetDateTime::now_utc().unix_timestamp();
+            // bad: kty/crv don't match EdDSA expectations
+            let h = serde_json::json!({"typ":"dpop+jwt","alg":"EdDSA","jwk":{"kty":"EC","crv":"P-256","x":x,"y":x}});
+            let p = serde_json::json!({"jti":"ed-badjwk","iat":now,"htm":"GET","htu":"https://ex.com/a"});
+            let jws = make_jws_ed(&sk, h, p);
+
+            let mut store = super::MemoryStore::default();
+            let err = verify_proof(
+                &mut store,
+                &jws,
+                "https://ex.com/a",
+                "GET",
+                None,
+                VerifyOptions::default(),
+            )
+            .await
+            .unwrap_err();
+            matches!(err, DpopError::BadJwk(_));
+        }
+
+        #[tokio::test]
+        async fn eddsa_signature_tamper_detected() {
+            let (sk, x) = gen_ed25519();
+            let now = OffsetDateTime::now_utc().unix_timestamp();
+            let h = serde_json::json!({"typ":"dpop+jwt","alg":"EdDSA","jwk":{"kty":"OKP","crv":"Ed25519","x":x}});
+            let p = serde_json::json!({"jti":"ed-tamper","iat":now,"htm":"GET","htu":"https://ex.com/a"});
+            let mut jws = make_jws_ed(&sk, h, p);
+            // flip a byte in the header part (remain base64url-ish length)
+            unsafe {
+                let bytes = jws.as_bytes_mut();
+                for i in 10..(bytes.len().min(40)) {
+                    bytes[i] ^= 1;
+                    break;
+                }
+            }
+            let mut store = super::MemoryStore::default();
+            let err = verify_proof(
+                &mut store,
+                &jws,
+                "https://ex.com/a",
+                "GET",
+                None,
+                VerifyOptions::default(),
+            )
+            .await
+            .unwrap_err();
+            matches!(err, DpopError::InvalidSignature);
+        }
     }
 }

@@ -1,11 +1,12 @@
-use base64::Engine;
+use crate::DpopError;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64;
+use base64::Engine;
+#[cfg(feature = "eddsa")]
+use ed25519_dalek::VerifyingKey as Ed25519VerifyingKey;
 use p256::ecdsa::VerifyingKey;
 use p256::{EncodedPoint, FieldBytes};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
-
-use crate::DpopError;
 
 /// Build a P-256 verifying key from JWK x/y (base64url, no padding).
 pub fn verifying_key_from_p256_xy(x_b64: &str, y_b64: &str) -> Result<VerifyingKey, DpopError> {
@@ -36,6 +37,32 @@ pub fn thumbprint_ec_p256(x_b64: &str, y_b64: &str) -> Result<String, DpopError>
     m.insert("x", x_b64);
     m.insert("y", y_b64);
     let canonical = serde_json::to_string(&m).map_err(|_| DpopError::BadJwk("canonicalize"))?;
+    Ok(B64.encode(Sha256::digest(canonical.as_bytes())))
+}
+
+#[cfg(feature = "eddsa")]
+pub fn verifying_key_from_okp_ed25519(
+    x_b64: &str,
+) -> Result<Ed25519VerifyingKey, crate::DpopError> {
+    let x = B64
+        .decode(x_b64)
+        .map_err(|_| crate::DpopError::BadJwk("bad jwk.x"))?;
+    if x.len() != 32 {
+        return Err(crate::DpopError::BadJwk("jwk x must be 32 bytes"));
+    }
+    Ed25519VerifyingKey::from_bytes(&x.try_into().unwrap())
+        .map_err(|_| crate::DpopError::BadJwk("invalid Ed25519 key"))
+}
+
+#[cfg(feature = "eddsa")]
+pub fn thumbprint_okp_ed25519(x_b64: &str) -> Result<String, crate::DpopError> {
+    // RFC 7638 canonical JWK members (sorted): kty, crv, x
+    let mut m = BTreeMap::new();
+    m.insert("crv", "Ed25519");
+    m.insert("kty", "OKP");
+    m.insert("x", x_b64);
+    let canonical =
+        serde_json::to_string(&m).map_err(|_| crate::DpopError::BadJwk("canonicalize"))?;
     Ok(B64.encode(Sha256::digest(canonical.as_bytes())))
 }
 
