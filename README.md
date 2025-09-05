@@ -2,14 +2,12 @@
 # Dpop Verifier
 
 A tiny DPoP proof verifier for Rust:
-- ES256 over P-256 only (per spec’s MTI)
+- ES256/P-256
+- EdDSA/PS256 (with feature "edssa")
 - Manual claim checks (htm/htu/iat/ath)
 - Pluggable replay store (DB/Redis/etc.)
 - DPoP-Nonce support
 - Optional Actix helper to canonicalize request URL
-
-Not yet implemented, but planned:
-- EdDSA/PS256 support
 
 Made this small crate for my own needs. If you feel it's lacking or is missing something and/or does not actually follow the spec etc. feel free to open an issue.
 
