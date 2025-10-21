@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use dpop_verifier::{DpopError, ReplayContext, ReplayStore, VerifyOptions, verify_proof};
+use dpop_verifier::{DpopError, DpopVerifier, ReplayContext, ReplayStore};
 use std::collections::HashSet;
 use std::io::{self, Read};
 
@@ -27,16 +27,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let expected_htm = std::env::var("HTM").unwrap_or_else(|_| "POST".into());
 
     let mut store = MemoryStore(HashSet::new());
-    let v = verify_proof(
-        &mut store,
-        dpop,
-        &expected_htu,
-        &expected_htm,
-        None,
-        VerifyOptions::default(),
-    )
-    .await?;
+    
+    // Use the new DpopVerifier API with builder pattern
+    let verifier = DpopVerifier::new()
+        .with_max_age(300)
+        .with_future_skew(5);
+    
+    let verified = verifier
+        .verify(&mut store, dpop, &expected_htu, &expected_htm, None)
+        .await?;
 
-    println!("Verified! jkt={}, jti={}, iat={}", v.jkt, v.jti, v.iat);
+    println!("Verified! jkt={}, jti={}, iat={}", verified.jkt, verified.jti, verified.iat);
     Ok(())
 }

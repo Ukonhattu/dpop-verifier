@@ -6,7 +6,7 @@ use crate::DpopError;
 
 #[cfg(feature = "actix-web")]
 /// Return the single DPoP header as &str; error if missing or multiple.
-pub fn dpop_header_str<'a>(req: &'a HttpRequest) -> Result<&'a str, DpopError> {
+pub fn dpop_header_str(req: &HttpRequest) -> Result<&str, DpopError> {
     // Reject more than one header field
     let mut it = req.headers().get_all("DPoP");
     let first = it.next().ok_or(DpopError::MalformedJws)?;

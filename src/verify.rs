@@ -11,6 +11,13 @@ use crate::replay::{ReplayContext, ReplayStore};
 use crate::DpopError;
 use p256::ecdsa::{signature::Verifier, VerifyingKey};
 
+// Constants for signature and token validation
+const ECDSA_P256_SIGNATURE_LENGTH: usize = 64;
+#[cfg(feature = "eddsa")]
+const ED25519_SIGNATURE_LENGTH: usize = 64;
+const JTI_HASH_LENGTH: usize = 32;
+const JTI_MAX_LENGTH: usize = 512;
+
 #[derive(Deserialize)]
 struct DpopHeader {
     typ: String,
@@ -70,7 +77,390 @@ pub struct VerifiedDpop {
     pub iat: i64,
 }
 
+/// Helper struct for type-safe JTI hash handling
+struct JtiHash([u8; JTI_HASH_LENGTH]);
+
+impl JtiHash {
+    /// Create a JTI hash from the SHA-256 digest
+    fn from_jti(jti: &str) -> Self {
+        let mut hasher = Sha256::new();
+        hasher.update(jti.as_bytes());
+        let digest = hasher.finalize();
+        let mut hash = [0u8; JTI_HASH_LENGTH];
+        hash.copy_from_slice(&digest[..JTI_HASH_LENGTH]);
+        JtiHash(hash)
+    }
+
+    /// Get the inner array
+    fn as_array(&self) -> [u8; JTI_HASH_LENGTH] {
+        self.0
+    }
+}
+
+/// Parsed DPoP token structure
+struct DpopToken {
+    header: DpopHeader,
+    payload_b64: String,
+    signature_bytes: Vec<u8>,
+    signing_input: String,
+}
+
+/// Structured DPoP claims
+#[derive(Deserialize)]
+struct DpopClaims {
+    jti: String,
+    iat: i64,
+    htm: String,
+    htu: String,
+    #[serde(default)]
+    ath: Option<String>,
+    #[serde(default)]
+    nonce: Option<String>,
+}
+
+/// Main DPoP verifier with builder pattern
+pub struct DpopVerifier {
+    options: VerifyOptions,
+}
+
+impl DpopVerifier {
+    /// Create a new DPoP verifier with default options
+    pub fn new() -> Self {
+        Self {
+            options: VerifyOptions::default(),
+        }
+    }
+
+    /// Set the maximum age for DPoP proofs
+    pub fn with_max_age(mut self, max_age_secs: i64) -> Self {
+        self.options.max_age_secs = max_age_secs;
+        self
+    }
+
+    /// Set the future skew tolerance
+    pub fn with_future_skew(mut self, future_skew_secs: i64) -> Self {
+        self.options.future_skew_secs = future_skew_secs;
+        self
+    }
+
+    /// Set the nonce mode
+    pub fn with_nonce_mode(mut self, nonce_mode: NonceMode) -> Self {
+        self.options.nonce_mode = nonce_mode;
+        self
+    }
+
+    /// Verify a DPoP proof
+    pub async fn verify<S: ReplayStore + ?Sized>(
+        &self,
+        store: &mut S,
+        dpop_compact_jws: &str,
+        expected_htu: &str,
+        expected_htm: &str,
+        maybe_access_token: Option<&str>,
+    ) -> Result<VerifiedDpop, DpopError> {
+        // Parse the token
+        let token = self.parse_token(dpop_compact_jws)?;
+        
+        // Validate header
+        self.validate_header(&token.header)?;
+        
+        // Verify signature and compute JKT
+        let jkt = self.verify_signature_and_compute_jkt(&token)?;
+        
+        // Parse claims
+        let claims: DpopClaims = {
+            let bytes = B64.decode(&token.payload_b64).map_err(|_| DpopError::MalformedJws)?;
+            serde_json::from_slice(&bytes).map_err(|_| DpopError::MalformedJws)?
+        };
+        
+        // Validate JTI length
+        if claims.jti.len() > JTI_MAX_LENGTH {
+            return Err(DpopError::JtiTooLong);
+        }
+        
+        // Validate HTTP binding (HTM/HTU)
+        let (expected_htm_normalized, expected_htu_normalized) = 
+            self.validate_http_binding(&claims, expected_htm, expected_htu)?;
+        
+        // Validate access token binding if present
+        if let Some(access_token) = maybe_access_token {
+            self.validate_access_token_binding(&claims, access_token)?;
+        }
+        
+        // Check timestamp freshness
+        self.check_timestamp_freshness(claims.iat)?;
+        
+        // Validate nonce if required
+        self.validate_nonce_if_required(
+            &claims,
+            &expected_htu_normalized,
+            &expected_htm_normalized,
+            &jkt,
+        )?;
+        
+        // Prevent replay
+        let jti_hash = JtiHash::from_jti(&claims.jti);
+        self.prevent_replay(store, jti_hash, &claims, &jkt).await?;
+        
+        Ok(VerifiedDpop {
+            jkt,
+            jti: claims.jti,
+            iat: claims.iat,
+        })
+    }
+
+    /// Parse compact JWS into token components
+    fn parse_token(&self, dpop_compact_jws: &str) -> Result<DpopToken, DpopError> {
+        let mut jws_parts = dpop_compact_jws.split('.');
+        let (header_b64, payload_b64, signature_b64) = match (jws_parts.next(), jws_parts.next(), jws_parts.next()) {
+            (Some(h), Some(p), Some(s)) if jws_parts.next().is_none() => (h, p, s),
+            _ => return Err(DpopError::MalformedJws),
+        };
+
+        // Decode JOSE header
+        let header: DpopHeader = {
+            let bytes = B64.decode(header_b64).map_err(|_| DpopError::MalformedJws)?;
+            let val: serde_json::Value =
+                serde_json::from_slice(&bytes).map_err(|_| DpopError::MalformedJws)?;
+            // MUST NOT include private JWK material
+            if val.get("jwk").and_then(|j| j.get("d")).is_some() {
+                return Err(DpopError::BadJwk("jwk must not include 'd'"));
+            }
+            serde_json::from_value(val).map_err(|_| DpopError::MalformedJws)?
+        };
+
+        let signing_input = format!("{}.{}", header_b64, payload_b64);
+        let signature_bytes = B64.decode(signature_b64).map_err(|_| DpopError::InvalidSignature)?;
+
+        Ok(DpopToken {
+            header,
+            payload_b64: payload_b64.to_string(),
+            signature_bytes,
+            signing_input,
+        })
+    }
+
+    /// Validate the DPoP header (typ and alg checks)
+    fn validate_header(&self, header: &DpopHeader) -> Result<(), DpopError> {
+        if header.typ != "dpop+jwt" {
+            return Err(DpopError::MalformedJws);
+        }
+        Ok(())
+    }
+
+    /// Verify signature and compute JKT (JSON Key Thumbprint)
+    fn verify_signature_and_compute_jkt(&self, token: &DpopToken) -> Result<String, DpopError> {
+        let jkt = match (token.header.alg.as_str(), &token.header.jwk) {
+            ("ES256", Jwk::EcP256 { kty, crv, x, y }) if kty == "EC" && crv == "P-256" => {
+                if token.signature_bytes.len() != ECDSA_P256_SIGNATURE_LENGTH {
+                    return Err(DpopError::InvalidSignature);
+                }
+
+                let verifying_key: VerifyingKey = verifying_key_from_p256_xy(x, y)?;
+                let signature = p256::ecdsa::Signature::from_slice(&token.signature_bytes)
+                    .map_err(|_| DpopError::InvalidSignature)?;
+                verifying_key.verify(token.signing_input.as_bytes(), &signature)
+                    .map_err(|_| DpopError::InvalidSignature)?;
+                // compute EC thumbprint
+                thumbprint_ec_p256(x, y)?
+            }
+
+            #[cfg(feature = "eddsa")]
+            ("EdDSA", Jwk::OkpEd25519 { kty, crv, x }) if kty == "OKP" && crv == "Ed25519" => {
+                use ed25519_dalek::{Signature as EdSig, VerifyingKey as EdVk};
+                use signature::Verifier as _;
+
+                if token.signature_bytes.len() != ED25519_SIGNATURE_LENGTH {
+                    return Err(DpopError::InvalidSignature);
+                }
+
+                let verifying_key: EdVk = crate::jwk::verifying_key_from_okp_ed25519(x)?;
+                let signature = EdSig::from_slice(&token.signature_bytes)
+                    .map_err(|_| DpopError::InvalidSignature)?;
+                verifying_key.verify(token.signing_input.as_bytes(), &signature)
+                    .map_err(|_| DpopError::InvalidSignature)?;
+                crate::jwk::thumbprint_okp_ed25519(x)?
+            }
+
+            ("EdDSA", _) => return Err(DpopError::BadJwk("expect OKP/Ed25519 for EdDSA")),
+            ("ES256", _) => return Err(DpopError::BadJwk("expect EC/P-256 for ES256")),
+            ("none", _) => return Err(DpopError::InvalidAlg("none".into())),
+            (a, _) if a.starts_with("HS") => return Err(DpopError::InvalidAlg(a.into())),
+            (other, _) => return Err(DpopError::UnsupportedAlg(other.into())),
+        };
+
+        Ok(jkt)
+    }
+
+    /// Validate HTTP method and URI binding
+    fn validate_http_binding(
+        &self,
+        claims: &DpopClaims,
+        expected_htm: &str,
+        expected_htu: &str,
+    ) -> Result<(String, String), DpopError> {
+        // Strict method & URI checks (normalize both sides, then exact compare)
+        let expected_htm_normalized = normalize_method(expected_htm)?;
+        let actual_htm_normalized = normalize_method(&claims.htm)?;
+        if actual_htm_normalized != expected_htm_normalized {
+            return Err(DpopError::HtmMismatch);
+        }
+
+        let expected_htu_normalized = normalize_htu(expected_htu)?;
+        let actual_htu_normalized = normalize_htu(&claims.htu)?;
+        if actual_htu_normalized != expected_htu_normalized {
+            return Err(DpopError::HtuMismatch);
+        }
+
+        Ok((expected_htm_normalized, expected_htu_normalized))
+    }
+
+    /// Validate access token hash binding
+    fn validate_access_token_binding(
+        &self,
+        claims: &DpopClaims,
+        access_token: &str,
+    ) -> Result<(), DpopError> {
+        // Compute expected SHA-256 bytes of the exact token octets
+        let expected_hash = Sha256::digest(access_token.as_bytes());
+        
+        // Decode provided ath (must be base64url no-pad)
+        let ath_b64 = claims.ath.as_ref().ok_or(DpopError::MissingAth)?;
+        let actual_hash = B64
+            .decode(ath_b64.as_bytes())
+            .map_err(|_| DpopError::AthMalformed)?;
+        
+        // Constant-time compare of raw digests
+        if actual_hash.len() != expected_hash.len() || !bool::from(actual_hash.ct_eq(&expected_hash[..])) {
+            return Err(DpopError::AthMismatch);
+        }
+
+        Ok(())
+    }
+
+    /// Check timestamp freshness with configured limits
+    fn check_timestamp_freshness(&self, iat: i64) -> Result<(), DpopError> {
+        let current_time = OffsetDateTime::now_utc().unix_timestamp();
+        if iat > current_time + self.options.future_skew_secs {
+            return Err(DpopError::FutureSkew);
+        }
+        if current_time - iat > self.options.max_age_secs {
+            return Err(DpopError::Stale);
+        }
+        Ok(())
+    }
+
+    /// Validate nonce if required by configuration
+    fn validate_nonce_if_required(
+        &self,
+        claims: &DpopClaims,
+        expected_htu_normalized: &str,
+        expected_htm_normalized: &str,
+        jkt: &str,
+    ) -> Result<(), DpopError> {
+        match &self.options.nonce_mode {
+            NonceMode::Disabled => { /* do nothing */ }
+            NonceMode::RequireEqual { expected_nonce } => {
+                let nonce_value = claims.nonce.as_ref().ok_or(DpopError::MissingNonce)?;
+                if nonce_value != expected_nonce {
+                    let fresh_nonce = expected_nonce.to_string();
+                    return Err(DpopError::UseDpopNonce { nonce: fresh_nonce });
+                }
+            }
+            NonceMode::Hmac {
+                secret,
+                max_age_secs,
+                bind_htu_htm,
+                bind_jkt,
+            } => {
+                let nonce_value = match &claims.nonce {
+                    Some(s) => s.as_str(),
+                    None => {
+                        // Missing → ask client to retry with nonce
+                        let current_time = time::OffsetDateTime::now_utc().unix_timestamp();
+                        let nonce_ctx = crate::nonce::NonceCtx {
+                            htu: if *bind_htu_htm {
+                                Some(expected_htu_normalized)
+                            } else {
+                                None
+                            },
+                            htm: if *bind_htu_htm {
+                                Some(expected_htm_normalized)
+                            } else {
+                                None
+                            },
+                            jkt: if *bind_jkt { Some(jkt) } else { None },
+                        };
+                        let fresh_nonce = crate::nonce::issue_nonce(secret, current_time, &nonce_ctx);
+                        return Err(DpopError::UseDpopNonce { nonce: fresh_nonce });
+                    }
+                };
+                
+                let current_time = time::OffsetDateTime::now_utc().unix_timestamp();
+                let nonce_ctx = crate::nonce::NonceCtx {
+                    htu: if *bind_htu_htm {
+                        Some(expected_htu_normalized)
+                    } else {
+                        None
+                    },
+                    htm: if *bind_htu_htm {
+                        Some(expected_htm_normalized)
+                    } else {
+                        None
+                    },
+                    jkt: if *bind_jkt { Some(jkt) } else { None },
+                };
+                
+                if crate::nonce::verify_nonce(secret, nonce_value, current_time, *max_age_secs, &nonce_ctx).is_err() {
+                    // On invalid/stale → emit NEW nonce so client can retry immediately
+                    let fresh_nonce = crate::nonce::issue_nonce(secret, current_time, &nonce_ctx);
+                    return Err(DpopError::UseDpopNonce { nonce: fresh_nonce });
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Prevent replay attacks using the replay store
+    async fn prevent_replay<S: ReplayStore + ?Sized>(
+        &self,
+        store: &mut S,
+        jti_hash: JtiHash,
+        claims: &DpopClaims,
+        jkt: &str,
+    ) -> Result<(), DpopError> {
+        let is_first_use = store
+            .insert_once(
+                jti_hash.as_array(),
+                ReplayContext {
+                    jkt: Some(jkt),
+                    htm: Some(&claims.htm),
+                    htu: Some(&claims.htu),
+                    iat: claims.iat,
+                },
+            )
+            .await?;
+        
+        if !is_first_use {
+            return Err(DpopError::Replay);
+        }
+
+        Ok(())
+    }
+}
+
+impl Default for DpopVerifier {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Verify DPoP proof and record the jti to prevent replays.
+/// 
+/// # Deprecated
+/// This function is maintained for backward compatibility. New code should use `DpopVerifier` instead.
+/// See the `DpopVerifier` documentation for usage examples.
+#[deprecated(since = "2.0.0", note = "Use DpopVerifier instead")]
 pub async fn verify_proof<S: ReplayStore + ?Sized>(
     store: &mut S,
     dpop_compact_jws: &str,
@@ -79,223 +469,10 @@ pub async fn verify_proof<S: ReplayStore + ?Sized>(
     maybe_access_token: Option<&str>,
     opts: VerifyOptions,
 ) -> Result<VerifiedDpop, DpopError> {
-    let mut it = dpop_compact_jws.split('.');
-    let (h_b64, p_b64, s_b64) = match (it.next(), it.next(), it.next()) {
-        (Some(h), Some(p), Some(s)) if it.next().is_none() => (h, p, s),
-        _ => return Err(DpopError::MalformedJws),
+    let verifier = DpopVerifier {
+        options: opts,
     };
-
-    // Decode JOSE header (as Value first, to reject private 'd')
-    let hdr: DpopHeader = {
-        let bytes = B64.decode(h_b64).map_err(|_| DpopError::MalformedJws)?;
-        let val: serde_json::Value =
-            serde_json::from_slice(&bytes).map_err(|_| DpopError::MalformedJws)?;
-        // MUST NOT include private JWK material
-        if val.get("jwk").and_then(|j| j.get("d")).is_some() {
-            return Err(DpopError::BadJwk("jwk must not include 'd'"));
-        }
-        serde_json::from_value(val).map_err(|_| DpopError::MalformedJws)?
-    };
-
-    // After you parsed `hdr` and blocked private 'd'
-    if hdr.typ != "dpop+jwt" {
-        return Err(DpopError::MalformedJws);
-    }
-
-    let signing_input = {
-        let mut s = String::with_capacity(h_b64.len() + 1 + p_b64.len());
-        s.push_str(h_b64);
-        s.push('.');
-        s.push_str(p_b64);
-        s
-    };
-    let sig_bytes = B64.decode(s_b64).map_err(|_| DpopError::InvalidSignature)?;
-    if sig_bytes.len() != 64 {
-        return Err(DpopError::InvalidSignature);
-    }
-
-    let jkt = match (hdr.alg.as_str(), &hdr.jwk) {
-        ("ES256", Jwk::EcP256 { kty, crv, x, y }) if kty == "EC" && crv == "P-256" => {
-            let vk: VerifyingKey = verifying_key_from_p256_xy(x, y)?;
-            let sig = p256::ecdsa::Signature::from_slice(&sig_bytes)
-                .map_err(|_| DpopError::InvalidSignature)?;
-            vk.verify(signing_input.as_bytes(), &sig)
-                .map_err(|_| DpopError::InvalidSignature)?;
-            // compute EC thumbprint
-            thumbprint_ec_p256(x, y)?
-        }
-
-        #[cfg(feature = "eddsa")]
-        ("EdDSA", Jwk::OkpEd25519 { kty, crv, x }) if kty == "OKP" && crv == "Ed25519" => {
-            use ed25519_dalek::{Signature as EdSig, VerifyingKey as EdVk};
-            use signature::Verifier as _;
-
-            let vk: EdVk = crate::jwk::verifying_key_from_okp_ed25519(x)?;
-            let sig = EdSig::from_slice(&sig_bytes).map_err(|_| DpopError::InvalidSignature)?;
-            vk.verify(signing_input.as_bytes(), &sig)
-                .map_err(|_| DpopError::InvalidSignature)?;
-            crate::jwk::thumbprint_okp_ed25519(x)?
-        }
-
-        ("EdDSA", _) => return Err(DpopError::BadJwk("expect OKP/Ed25519 for EdDSA")),
-        ("ES256", _) => return Err(DpopError::BadJwk("expect EC/P-256 for ES256")),
-        ("none", _) => return Err(DpopError::InvalidAlg("none".into())),
-        (a, _) if a.starts_with("HS") => return Err(DpopError::InvalidAlg(a.into())),
-        (other, _) => return Err(DpopError::UnsupportedAlg(other.into())),
-    };
-
-    let claims: serde_json::Value = {
-        let bytes = B64.decode(p_b64).map_err(|_| DpopError::MalformedJws)?;
-        serde_json::from_slice(&bytes).map_err(|_| DpopError::MalformedJws)?
-    };
-
-    let jti = claims
-        .get("jti")
-        .and_then(|v| v.as_str())
-        .ok_or(DpopError::MissingClaim("jti"))?;
-    if jti.len() > 512 {
-        return Err(DpopError::JtiTooLong);
-    }
-    let iat = claims
-        .get("iat")
-        .and_then(|v| v.as_i64())
-        .ok_or(DpopError::MissingClaim("iat"))?;
-    let htm = claims
-        .get("htm")
-        .and_then(|v| v.as_str())
-        .ok_or(DpopError::MissingClaim("htm"))?;
-    let htu = claims
-        .get("htu")
-        .and_then(|v| v.as_str())
-        .ok_or(DpopError::MissingClaim("htu"))?;
-
-    // Strict method & URI checks (normalize both sides, then exact compare)
-    let want_htm = normalize_method(expected_htm)?; // e.g., "GET"
-    let got_htm = normalize_method(htm)?; // from claims
-    if got_htm != want_htm {
-        return Err(DpopError::HtmMismatch);
-    }
-
-    let want_htu = normalize_htu(expected_htu)?; // scheme://host[:port]/path (no q/frag)
-    let got_htu = normalize_htu(htu)?;
-    if got_htu != want_htu {
-        return Err(DpopError::HtuMismatch);
-    }
-
-    // Optional ath (only when an access token is being presented)
-    if let Some(at) = maybe_access_token {
-        // Compute expected SHA-256 bytes of the exact token octets:
-        let want = Sha256::digest(at.as_bytes());
-        // Decode provided ath (must be base64url no-pad):
-        let got_b64 = claims
-            .get("ath")
-            .and_then(|v| v.as_str())
-            .ok_or(DpopError::MissingAth)?;
-        let got = B64
-            .decode(got_b64.as_bytes())
-            .map_err(|_| DpopError::AthMalformed)?;
-        // Constant-time compare of raw digests:
-        if got.len() != want.len() || !bool::from(got.ct_eq(&want[..])) {
-            return Err(DpopError::AthMismatch);
-        }
-    }
-
-    // Freshness (iat)
-    let now = OffsetDateTime::now_utc().unix_timestamp();
-    if iat > now + opts.future_skew_secs {
-        return Err(DpopError::FutureSkew);
-    }
-    if now - iat > opts.max_age_secs {
-        return Err(DpopError::Stale);
-    }
-
-    // Replay prevention (store SHA-256(jti))
-    let mut hasher = Sha256::new();
-    hasher.update(jti.as_bytes());
-    let mut jti_hash = [0u8; 32];
-    jti_hash.copy_from_slice(&hasher.finalize());
-
-    let nonce_claim = claims.get("nonce").and_then(|v| v.as_str());
-
-    match &opts.nonce_mode {
-        NonceMode::Disabled => { /* do nothing */ }
-        NonceMode::RequireEqual { expected_nonce } => {
-            let n = nonce_claim.ok_or(DpopError::MissingNonce)?;
-            if n != expected_nonce {
-                let fresh = expected_nonce.to_string(); // or issue a new one if you prefer
-                return Err(DpopError::UseDpopNonce { nonce: fresh });
-            }
-        }
-        NonceMode::Hmac {
-            secret,
-            max_age_secs,
-            bind_htu_htm,
-            bind_jkt,
-        } => {
-            let n = match nonce_claim {
-                Some(s) => s,
-                None => {
-                    // Missing → ask client to retry with nonce
-                    let now = time::OffsetDateTime::now_utc().unix_timestamp();
-                    let ctx = crate::nonce::NonceCtx {
-                        htu: if *bind_htu_htm {
-                            Some(want_htu.as_str())
-                        } else {
-                            None
-                        },
-                        htm: if *bind_htu_htm {
-                            Some(want_htm.as_str())
-                        } else {
-                            None
-                        },
-                        jkt: if *bind_jkt { Some(jkt.as_str()) } else { None },
-                    };
-                    let fresh = crate::nonce::issue_nonce(secret, now, &ctx);
-                    return Err(DpopError::UseDpopNonce { nonce: fresh });
-                }
-            };
-            let now = time::OffsetDateTime::now_utc().unix_timestamp();
-            let ctx = crate::nonce::NonceCtx {
-                htu: if *bind_htu_htm {
-                    Some(want_htu.as_str())
-                } else {
-                    None
-                },
-                htm: if *bind_htu_htm {
-                    Some(want_htm.as_str())
-                } else {
-                    None
-                },
-                jkt: if *bind_jkt { Some(jkt.as_str()) } else { None },
-            };
-            if let Err(_) = crate::nonce::verify_nonce(secret, n, now, *max_age_secs, &ctx) {
-                // On invalid/stale → emit NEW nonce so client can retry immediately
-                let fresh = crate::nonce::issue_nonce(secret, now, &ctx);
-                return Err(DpopError::UseDpopNonce { nonce: fresh });
-            }
-        }
-    }
-
-    let ok = store
-        .insert_once(
-            jti_hash,
-            ReplayContext {
-                jkt: Some(&jkt),
-                htm: Some(htm),
-                htu: Some(htu),
-                iat,
-            },
-        )
-        .await?;
-    if !ok {
-        return Err(DpopError::Replay);
-    }
-
-    Ok(VerifiedDpop {
-        jkt,
-        jti: jti.to_string(),
-        iat,
-    })
+    verifier.verify(store, dpop_compact_jws, expected_htu, expected_htm, maybe_access_token).await
 }
 
 #[cfg(test)]
@@ -310,27 +487,27 @@ mod tests {
     // ---- helpers ----------------------------------------------------------------
 
     fn gen_es256_key() -> (SigningKey, String, String) {
-        let sk = SigningKey::random(&mut OsRng);
-        let vk = VerifyingKey::from(&sk);
-        let ep = vk.to_encoded_point(false);
-        let x = B64.encode(ep.x().unwrap());
-        let y = B64.encode(ep.y().unwrap());
-        (sk, x, y)
+        let signing_key = SigningKey::random(&mut OsRng);
+        let verifying_key = VerifyingKey::from(&signing_key);
+        let encoded_point = verifying_key.to_encoded_point(false);
+        let x_coordinate = B64.encode(encoded_point.x().unwrap());
+        let y_coordinate = B64.encode(encoded_point.y().unwrap());
+        (signing_key, x_coordinate, y_coordinate)
     }
 
     fn make_jws(
-        sk: &SigningKey,
-        header_val: serde_json::Value,
-        claims_val: serde_json::Value,
+        signing_key: &SigningKey,
+        header_json: serde_json::Value,
+        claims_json: serde_json::Value,
     ) -> String {
-        let h = serde_json::to_vec(&header_val).unwrap();
-        let p = serde_json::to_vec(&claims_val).unwrap();
-        let h_b64 = B64.encode(h);
-        let p_b64 = B64.encode(p);
-        let signing_input = format!("{h_b64}.{p_b64}");
-        let sig: Signature = sk.sign(signing_input.as_bytes());
-        let s_b64 = B64.encode(sig.to_bytes());
-        format!("{h_b64}.{p_b64}.{s_b64}")
+        let header_bytes = serde_json::to_vec(&header_json).unwrap();
+        let payload_bytes = serde_json::to_vec(&claims_json).unwrap();
+        let header_b64 = B64.encode(header_bytes);
+        let payload_b64 = B64.encode(payload_bytes);
+        let signing_input = format!("{header_b64}.{payload_b64}");
+        let signature: Signature = signing_key.sign(signing_input.as_bytes());
+        let signature_b64 = B64.encode(signature.to_bytes());
+        format!("{header_b64}.{payload_b64}.{signature_b64}")
     }
 
     #[derive(Default)]

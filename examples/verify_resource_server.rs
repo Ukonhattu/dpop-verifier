@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use dpop_verifier::{DpopError, ReplayContext, ReplayStore, VerifyOptions, verify_proof};
+use dpop_verifier::{DpopError, DpopVerifier, ReplayContext, ReplayStore};
 use std::collections::HashSet;
 use std::io::{self, Read};
 
@@ -36,19 +36,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::env::var("ACCESS_TOKEN").expect("set ACCESS_TOKEN env var for RS verification");
 
     let mut store = MemoryStore(HashSet::new());
-    let v = verify_proof(
-        &mut store,
-        dpop,
-        &expected_htu,
-        &expected_htm,
-        Some(&access_token), // Require and verify `ath`
-        VerifyOptions::default(),
-    )
-    .await?;
+    
+    // Use the new DpopVerifier API with builder pattern
+    let verifier = DpopVerifier::new()
+        .with_max_age(300)
+        .with_future_skew(5);
+    
+    let verified = verifier
+        .verify(
+            &mut store,
+            dpop,
+            &expected_htu,
+            &expected_htm,
+            Some(&access_token), // Require and verify `ath`
+        )
+        .await?;
 
     eprintln!("Verified RS call:");
-    eprintln!("  jkt = {}", v.jkt);
-    eprintln!("  jti = {}", v.jti);
-    eprintln!("  iat = {}", v.iat);
+    eprintln!("  jkt = {}", verified.jkt);
+    eprintln!("  jti = {}", verified.jti);
+    eprintln!("  iat = {}", verified.iat);
     Ok(())
 }

@@ -21,8 +21,10 @@ use crate::DpopError;
 type HmacSha256 = Hmac<Sha256>;
 
 const NONCE_VERSION: u8 = 1;
-const RAND_LEN: usize = 16;
-const MAC_LEN: usize = 16; // truncated
+const NONCE_RANDOM_LENGTH: usize = 16;
+const NONCE_MAC_LENGTH: usize = 16; // truncated
+const NONCE_TOTAL_LENGTH: usize = 1 + 8 + 16 + 16; // version + timestamp + random + mac
+const NONCE_FUTURE_SKEW_SECS: i64 = 5;
 
 /// Optional binding context (only fields you want to bind).
 pub struct NonceCtx<'a> {
@@ -32,48 +34,54 @@ pub struct NonceCtx<'a> {
 }
 
 fn ctx_bytes(ctx: &NonceCtx<'_>) -> Vec<u8> {
-    let mut v = Vec::new();
+    let mut context_bytes = Vec::new();
     if let Some(htu) = ctx.htu {
-        v.extend_from_slice(b"HTU\0");
-        v.extend_from_slice(htu.as_bytes());
-        v.push(0);
+        context_bytes.extend_from_slice(b"HTU\0");
+        context_bytes.extend_from_slice(htu.as_bytes());
+        context_bytes.push(0);
     }
     if let Some(htm) = ctx.htm {
-        v.extend_from_slice(b"HTM\0");
-        v.extend_from_slice(htm.as_bytes());
-        v.push(0);
+        context_bytes.extend_from_slice(b"HTM\0");
+        context_bytes.extend_from_slice(htm.as_bytes());
+        context_bytes.push(0);
     }
     if let Some(jkt) = ctx.jkt {
-        v.extend_from_slice(b"JKT\0");
-        v.extend_from_slice(jkt.as_bytes());
-        v.push(0);
+        context_bytes.extend_from_slice(b"JKT\0");
+        context_bytes.extend_from_slice(jkt.as_bytes());
+        context_bytes.push(0);
     }
-    v
+    context_bytes
 }
 
 /// Issue a fresh nonce bound to the given context.
+/// 
+/// # Panics
+/// This function will panic if the HMAC secret is invalid (which should never happen
+/// since HmacSha256 accepts keys of any length).
 pub fn issue_nonce(secret: &[u8], now_unix: i64, ctx: &NonceCtx<'_>) -> String {
-    let ver = [NONCE_VERSION];
-    let ts = now_unix.to_be_bytes();
+    let version_bytes = [NONCE_VERSION];
+    let timestamp_bytes = now_unix.to_be_bytes();
 
-    let mut rand = [0u8; RAND_LEN];
-    OsRng.fill_bytes(&mut rand);
+    let mut random_bytes = [0u8; NONCE_RANDOM_LENGTH];
+    OsRng.fill_bytes(&mut random_bytes);
 
-    // MAC over (ver || ts || rand || ctx)
-    let mut mac = HmacSha256::new_from_slice(secret).expect("HMAC key");
-    mac.update(&ver);
-    mac.update(&ts);
-    mac.update(&rand);
-    mac.update(&ctx_bytes(ctx));
-    let tag = mac.finalize().into_bytes();
+    // MAC over (version || timestamp || random || context)
+    // HMAC-SHA256 accepts keys of any length, so this should never fail
+    let mut hmac = HmacSha256::new_from_slice(secret)
+        .expect("HMAC-SHA256 accepts keys of any length");
+    hmac.update(&version_bytes);
+    hmac.update(&timestamp_bytes);
+    hmac.update(&random_bytes);
+    hmac.update(&ctx_bytes(ctx));
+    let mac_tag = hmac.finalize().into_bytes();
 
-    let mut out = Vec::with_capacity(1 + 8 + RAND_LEN + MAC_LEN);
-    out.extend_from_slice(&ver);
-    out.extend_from_slice(&ts);
-    out.extend_from_slice(&rand);
-    out.extend_from_slice(&tag[..MAC_LEN]);
+    let mut nonce_bytes = Vec::with_capacity(NONCE_TOTAL_LENGTH);
+    nonce_bytes.extend_from_slice(&version_bytes);
+    nonce_bytes.extend_from_slice(&timestamp_bytes);
+    nonce_bytes.extend_from_slice(&random_bytes);
+    nonce_bytes.extend_from_slice(&mac_tag[..NONCE_MAC_LENGTH]);
 
-    B64.encode(out)
+    B64.encode(nonce_bytes)
 }
 
 /// Verify a nonce with age & skew limits, re-binding to the given context.
@@ -85,43 +93,53 @@ pub fn verify_nonce(
     max_age_secs: i64,
     ctx: &NonceCtx<'_>,
 ) -> Result<(), DpopError> {
-    let raw = B64
+    let nonce_bytes = B64
         .decode(nonce_b64.as_bytes())
         .map_err(|_| DpopError::NonceMismatch)?;
-    if raw.len() != 1 + 8 + RAND_LEN + MAC_LEN {
+    
+    if nonce_bytes.len() != NONCE_TOTAL_LENGTH {
         return Err(DpopError::NonceMismatch);
     }
 
-    let ver = raw[0];
-    if ver != NONCE_VERSION {
+    let version = nonce_bytes[0];
+    if version != NONCE_VERSION {
         return Err(DpopError::NonceMismatch);
     }
 
-    let mut ts_bytes = [0u8; 8];
-    ts_bytes.copy_from_slice(&raw[1..9]);
-    let ts = i64::from_be_bytes(ts_bytes);
+    // Safe extraction of timestamp bytes
+    let timestamp_bytes: [u8; 8] = nonce_bytes
+        .get(1..9)
+        .and_then(|slice| slice.try_into().ok())
+        .ok_or(DpopError::NonceMismatch)?;
+    let timestamp = i64::from_be_bytes(timestamp_bytes);
 
-    let rand = &raw[9..9 + RAND_LEN];
-    let mac_in = &raw[9 + RAND_LEN..];
+    // Safe extraction of random and MAC bytes
+    let random_bytes = nonce_bytes
+        .get(9..9 + NONCE_RANDOM_LENGTH)
+        .ok_or(DpopError::NonceMismatch)?;
+    let mac_from_nonce = nonce_bytes
+        .get(9 + NONCE_RANDOM_LENGTH..)
+        .ok_or(DpopError::NonceMismatch)?;
 
-    // Age & small future skew checks
-    if now_unix - ts > max_age_secs {
+    // Age & future skew checks
+    if now_unix - timestamp > max_age_secs {
         return Err(DpopError::NonceStale);
     }
-    // allow small future skew (5s)
-    if ts - now_unix > 5 {
+    if timestamp - now_unix > NONCE_FUTURE_SKEW_SECS {
         return Err(DpopError::FutureSkew);
     }
 
     // Recompute MAC
-    let mut mac = HmacSha256::new_from_slice(secret).expect("HMAC key");
-    mac.update(&[ver]);
-    mac.update(&ts.to_be_bytes());
-    mac.update(rand);
-    mac.update(&ctx_bytes(ctx));
-    let tag = mac.finalize().into_bytes();
+    // HMAC-SHA256 accepts keys of any length, so this should never fail
+    let mut hmac = HmacSha256::new_from_slice(secret)
+        .expect("HMAC-SHA256 accepts keys of any length");
+    hmac.update(&[version]);
+    hmac.update(&timestamp.to_be_bytes());
+    hmac.update(random_bytes);
+    hmac.update(&ctx_bytes(ctx));
+    let computed_mac = hmac.finalize().into_bytes();
 
-    if bool::from(mac_in.ct_eq(&tag[..MAC_LEN])) {
+    if bool::from(mac_from_nonce.ct_eq(&computed_mac[..NONCE_MAC_LENGTH])) {
         Ok(())
     } else {
         Err(DpopError::NonceMismatch)
@@ -136,17 +154,17 @@ pub fn verify_nonce_with_any(
     max_age_secs: i64,
     ctx: &NonceCtx<'_>,
 ) -> Result<(), DpopError> {
-    let mut last_err = DpopError::NonceMismatch;
-    for s in secrets {
-        match verify_nonce(s, nonce_b64, now_unix, max_age_secs, ctx) {
+    let mut last_error = DpopError::NonceMismatch;
+    for secret in secrets {
+        match verify_nonce(secret, nonce_b64, now_unix, max_age_secs, ctx) {
             Ok(()) => return Ok(()),
-            Err(e @ DpopError::FutureSkew)
-            | Err(e @ DpopError::NonceStale)
-            | Err(e @ DpopError::NonceMismatch) => last_err = e,
-            Err(e) => return Err(e),
+            Err(error @ DpopError::FutureSkew)
+            | Err(error @ DpopError::NonceStale)
+            | Err(error @ DpopError::NonceMismatch) => last_error = error,
+            Err(error) => return Err(error),
         }
     }
-    Err(last_err)
+    Err(last_error)
 }
 
 #[cfg(test)]
@@ -157,36 +175,36 @@ mod tests {
     #[test]
     fn roundtrip_ok_with_binding() {
         let secret = b"supersecretkey";
-        let now = OffsetDateTime::now_utc().unix_timestamp();
-        let ctx = NonceCtx {
+        let current_time = OffsetDateTime::now_utc().unix_timestamp();
+        let context = NonceCtx {
             htu: Some("https://ex.com/a"),
             htm: Some("POST"),
             jkt: Some("thumb"),
         };
 
-        let n = issue_nonce(secret, now, &ctx);
-        assert!(verify_nonce(secret, &n, now, 300, &ctx).is_ok());
+        let nonce = issue_nonce(secret, current_time, &context);
+        assert!(verify_nonce(secret, &nonce, current_time, 300, &context).is_ok());
     }
 
     #[test]
     fn bad_ctx_fails() {
         let secret = b"k";
-        let now = OffsetDateTime::now_utc().unix_timestamp();
-        let ctx1 = NonceCtx {
+        let current_time = OffsetDateTime::now_utc().unix_timestamp();
+        let original_context = NonceCtx {
             htu: Some("https://ex.com/a"),
             htm: Some("GET"),
             jkt: Some("t"),
         };
-        let n = issue_nonce(secret, now, &ctx1);
+        let nonce = issue_nonce(secret, current_time, &original_context);
 
         // Change HTU → should fail
-        let ctx2 = NonceCtx {
+        let different_context = NonceCtx {
             htu: Some("https://ex.com/b"),
             htm: Some("GET"),
             jkt: Some("t"),
         };
         assert!(matches!(
-            verify_nonce(secret, &n, now, 300, &ctx2),
+            verify_nonce(secret, &nonce, current_time, 300, &different_context),
             Err(DpopError::NonceMismatch)
         ));
     }
@@ -194,45 +212,45 @@ mod tests {
     #[test]
     fn stale_and_future_skew() {
         let secret = b"k2";
-        let now = OffsetDateTime::now_utc().unix_timestamp();
-        let ctx = NonceCtx {
+        let current_time = OffsetDateTime::now_utc().unix_timestamp();
+        let empty_context = NonceCtx {
             htu: None,
             htm: None,
             jkt: None,
         };
 
-        let n_future = issue_nonce(secret, now + 10, &ctx);
+        let future_nonce = issue_nonce(secret, current_time + 10, &empty_context);
         assert!(matches!(
-            verify_nonce(secret, &n_future, now, 300, &ctx),
+            verify_nonce(secret, &future_nonce, current_time, 300, &empty_context),
             Err(DpopError::FutureSkew)
         ));
 
-        let n_old = issue_nonce(secret, now - 301, &ctx);
+        let stale_nonce = issue_nonce(secret, current_time - 301, &empty_context);
         assert!(matches!(
-            verify_nonce(secret, &n_old, now, 300, &ctx),
+            verify_nonce(secret, &stale_nonce, current_time, 300, &empty_context),
             Err(DpopError::NonceStale)
         ));
     }
 
     #[test]
     fn rotation_any_secret() {
-        let s1 = b"current";
-        let s0 = b"previous";
-        let now = OffsetDateTime::now_utc().unix_timestamp();
-        let ctx = NonceCtx {
+        let current_secret = b"current";
+        let previous_secret = b"previous";
+        let current_time = OffsetDateTime::now_utc().unix_timestamp();
+        let context = NonceCtx {
             htu: Some("u"),
             htm: Some("M"),
             jkt: None,
         };
 
-        let n0 = issue_nonce(s0, now, &ctx);
+        let nonce_from_previous = issue_nonce(previous_secret, current_time, &context);
         assert!(
-            verify_nonce_with_any(&[s1.as_slice(), s0.as_slice()], &n0, now, 300, &ctx).is_ok()
+            verify_nonce_with_any(&[current_secret.as_slice(), previous_secret.as_slice()], &nonce_from_previous, current_time, 300, &context).is_ok()
         );
 
-        let n1 = issue_nonce(s1, now, &ctx);
+        let nonce_from_current = issue_nonce(current_secret, current_time, &context);
         assert!(
-            verify_nonce_with_any(&[s1.as_slice(), s0.as_slice()], &n1, now, 300, &ctx).is_ok()
+            verify_nonce_with_any(&[current_secret.as_slice(), previous_secret.as_slice()], &nonce_from_current, current_time, 300, &context).is_ok()
         );
     }
 }

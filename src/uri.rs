@@ -58,16 +58,16 @@ pub fn normalize_htu(input: &str) -> Result<String, DpopError> {
 }
 
 /// Normalize HTTP method for DPoP htm compare.
-pub fn normalize_method(m: &str) -> Result<String, DpopError> {
-    let up = m.trim().to_ascii_uppercase();
+pub fn normalize_method(method: &str) -> Result<String, DpopError> {
+    let uppercase_method = method.trim().to_ascii_uppercase();
     // Restrict to standard methods (expand if you need more)
     if !matches!(
-        up.as_str(),
+        uppercase_method.as_str(),
         "GET" | "POST" | "PUT" | "PATCH" | "DELETE" | "HEAD" | "OPTIONS" | "TRACE"
     ) {
         return Err(DpopError::InvalidMethod);
     }
-    Ok(up)
+    Ok(uppercase_method)
 }
 
 #[cfg(test)]

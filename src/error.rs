@@ -8,8 +8,6 @@ pub enum DpopError {
     InvalidDpopHeader,
     #[error("Missing DPoP header")]
     MissingDpopHeader,
-    #[error("missing DPoP header")]
-    MissingHeader,
     #[error("malformed DPoP JWT")]
     MalformedJws,
     #[error("Invalid algorithm")]
@@ -22,7 +20,7 @@ pub enum DpopError {
     BadJwk(&'static str),
     #[error("missing claim: {0}")]
     MissingClaim(&'static str),
-    #[error("Invaluid method")]
+    #[error("Invalid method")]
     InvalidMethod,
     #[error("htm mismatch")]
     HtmMismatch,
@@ -54,4 +52,6 @@ pub enum DpopError {
     NonceMismatch,
     #[error("Nonce is stale")]
     NonceStale,
+    #[error("Invalid HMAC configuration")]
+    InvalidHmacConfig,
 }
