@@ -3,7 +3,7 @@
 
 A tiny DPoP proof verifier for Rust:
 - ES256/P-256
-- EdDSA/PS256 (with feature "edssa")
+- EdDSA/Ed25519 (with feature "eddsa")
 - Manual claim checks (htm/htu/iat/ath)
 - Pluggable replay store (DB/Redis/etc.)
 - DPoP-Nonce support
@@ -16,7 +16,7 @@ Made this small crate for my own needs. If you feel it's lacking or is missing s
 Crates.io
 ```toml
 [dependencies]
-dpop-verifier = { version = "1.0.0", features = ["actix-web", "edssa" ] }
+dpop-verifier = { version = "1.0.0", features = ["actix-web", "eddsa"] }
 ```
 
 Git 
@@ -28,7 +28,7 @@ dpop-verifier = { git = "https://github.com/ukonhattu/dpop-verifier"} # Recommen
 ## Quick start (framework-agnostic)
 
 ```rust
-use dpop_verifier::{verify_proof, VerifyOptions, ReplayStore, ReplayContext, DpopError};
+use dpop_verifier::{DpopVerifier, ReplayStore, ReplayContext, DpopError};
 
 struct MyStore;
 
@@ -56,15 +56,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 3) If verifying at a Resource Server with an access token, pass it here (binds `ath`)
     let maybe_access_token = None::<&str>;
 
-    // 4) Verify proof and record its `jti` (via your `ReplayStore`)
+    // 4) Create a verifier with your desired options (builder pattern)
+    let verifier = DpopVerifier::new()
+        .with_max_age(300)       // 300s max age
+        .with_future_skew(5);    // 5s future skew tolerance
+
+    // 5) Verify proof and record its `jti` (via your `ReplayStore`)
     let mut store = MyStore;
-    let verified = verify_proof(
+    let verified = verifier.verify(
         &mut store,
         dpop,
         expected_htu,
         expected_htm,
         maybe_access_token,
-        VerifyOptions::default(), // 300s max age, 5s future skew
     ).await?;
 
     println!("DPoP key thumbprint (jkt): {}", verified.jkt);
@@ -72,16 +76,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-## Stateless nonce (redommended): `NonceMode:Hmac`
+## Stateless nonce (recommended): `NonceMode::Hmac`
 No DB needed. The verifier will issue a fresh nonce for you (in the error) and verify it on the next request. Bind the nonce to htu/htm/and the DPoP key (jkt).
 
 ```rust
 use std::sync::Arc;
-use dpop_verifier::{
-    verify_proof, VerifyOptions, NonceMode, DpopError
-};
+use dpop_verifier::{DpopVerifier, NonceMode, DpopError};
 #[cfg(feature="actix-web")]
-use dpop_verifier::actix_helpers::{dpop_header_str, canonicalize_request_url};
+use dpop_verifier::actix_helpers::{dpop_header_str, expected_htu_from_actix};
 
 struct App {
     dpop_secret: Arc<[u8]>, // keep in app state; rotate periodically
@@ -95,22 +97,22 @@ async fn protected(req: actix_web::HttpRequest, app: actix_web::web::Data<App>)
         Ok(s) => s,
         Err(_) => return actix_web::HttpResponse::Unauthorized().finish(),
     };
-    let expected_htu = canonicalize_request_url(&req);
+    let expected_htu = expected_htu_from_actix(&req, false);
     let expected_htm = req.method().as_str();
 
+    // Create verifier with HMAC nonce mode
     // If you also have an access token, pass it as Some(token) to bind `ath`.
-    let opts = VerifyOptions {
-        max_age_secs: 300,
-        future_skew_secs: 5,
-        nonce_mode: NonceMode::Hmac {
+    let verifier = DpopVerifier::new()
+        .with_max_age(300)
+        .with_future_skew(5)
+        .with_nonce_mode(NonceMode::Hmac {
             secret: app.dpop_secret.clone(),
             max_age_secs: 300,
             bind_htu_htm: true,
             bind_jkt: true,
-        },
-    };
+        });
 
-    match verify_proof(&mut (), dpop, &expected_htu, expected_htm, None, opts).await {
+    match verifier.verify(&mut (), dpop, &expected_htu, expected_htm, None).await {
         Ok(verified) => {
             // OK: verified.jkt is the key thumbprint bound to this request
             actix_web::HttpResponse::Ok().finish()
@@ -135,7 +137,7 @@ async fn protected(req: actix_web::HttpRequest, app: actix_web::web::Data<App>)
 If you already issue/store a nonce per client/session, require exact equality. (No context binding here; use HMAC mode if you want binding to htu/htm/jkt.)
 
 ```rust
-use dpop_verifier::{verify_proof, VerifyOptions, NonceMode, DpopError};
+use dpop_verifier::{DpopVerifier, NonceMode, DpopError};
 
 // Pseudo: fetch the previously issued nonce for this client/session
 fn load_expected_nonce(user_id: &str) -> Option<String> { /* ... */ None }
@@ -160,13 +162,14 @@ async fn protected(req: actix_web::HttpRequest, user_id: String) -> actix_web::H
         }
     };
 
-    let opts = VerifyOptions {
-        max_age_secs: 300,
-        future_skew_secs: 5,
-        nonce_mode: NonceMode::RequireEqual { expected_nonce: expected.clone() },
-    };
+    let verifier = DpopVerifier::new()
+        .with_max_age(300)
+        .with_future_skew(5)
+        .with_nonce_mode(NonceMode::RequireEqual { 
+            expected_nonce: expected.clone() 
+        });
 
-    match verify_proof(&mut (), dpop, &expected_htu, expected_htm, None, opts).await {
+    match verifier.verify(&mut (), dpop, &expected_htu, expected_htm, None).await {
         Ok(_) => actix_web::HttpResponse::Ok().finish(),
         Err(DpopError::UseDpopNonce { .. }) | Err(DpopError::MissingNonce) => {
             // Mismatch or missing -> issue a fresh one for the next try
@@ -207,7 +210,7 @@ Access-Control-Expose-Headers: WWW-Authenticate, DPoP-Nonce
 Enable ["actix-web"] feature
 
 ```rust
-use dpop_verifier::{verify_proof, VerifyOptions};
+use dpop_verifier::DpopVerifier;
 use dpop_verifier::actix_helpers::{dpop_header_str, expected_htu_from_actix};
 
 async fn handler(req: actix_web::HttpRequest) -> actix_web::Result<()> {
@@ -218,7 +221,11 @@ async fn handler(req: actix_web::HttpRequest) -> actix_web::Result<()> {
     // ... get your ReplayStore
     // let mut store = ...
 
-    verify_proof(&mut store, dpop, &expected_htu, expected_htm, None, VerifyOptions::default())
+    let verifier = DpopVerifier::new()
+        .with_max_age(300)
+        .with_future_skew(5);
+
+    verifier.verify(&mut store, dpop, &expected_htu, expected_htm, None)
         .await
         .map_err(|e| actix_web::error::ErrorUnauthorized(e.to_string()))?;
 
@@ -228,24 +235,52 @@ async fn handler(req: actix_web::HttpRequest) -> actix_web::Result<()> {
 
 > Proxy trust note: Only use X-Forwarded-* (true option) when you explicitly trust your proxy/load-balancer. Otherwise prefer connection info (false option).
 
-## Api Surface
+## API Surface
+
+### New API (recommended)
 ```rust
-pub async fn verify_proof<S: ReplayStore + ?Sized>(
-    store: &mut S,
-    dpop_compact_jws: &str,
-    expected_htu: &str,
-    expected_htm: &str,
-    maybe_access_token: Option<&str>,
-    opts: VerifyOptions,             // { max_age_secs: i64, future_skew_secs: i64 } (Default: 300 / 5..120)
-) -> Result<VerifiedDpop, DpopError>;
+pub struct DpopVerifier {
+    // Create with builder pattern
+}
+
+impl DpopVerifier {
+    pub fn new() -> Self;
+    pub fn with_max_age(self, max_age_secs: i64) -> Self;
+    pub fn with_future_skew(self, future_skew_secs: i64) -> Self;
+    pub fn with_nonce_mode(self, nonce_mode: NonceMode) -> Self;
+    
+    pub async fn verify<S: ReplayStore + ?Sized>(
+        &self,
+        store: &mut S,
+        dpop_compact_jws: &str,
+        expected_htu: &str,
+        expected_htm: &str,
+        maybe_access_token: Option<&str>,
+    ) -> Result<VerifiedDpop, DpopError>;
+}
 
 pub struct VerifiedDpop {
     pub jkt: String, // JWK SHA-256 thumbprint (base64url, no pad)
     pub jti: String,
     pub iat: i64,
 }
-
 ```
+
+### Legacy API (deprecated)
+The old `verify_proof` function is still available for backward compatibility but is deprecated:
+```rust
+#[deprecated]
+pub async fn verify_proof<S: ReplayStore + ?Sized>(
+    store: &mut S,
+    dpop_compact_jws: &str,
+    expected_htu: &str,
+    expected_htm: &str,
+    maybe_access_token: Option<&str>,
+    opts: VerifyOptions,
+) -> Result<VerifiedDpop, DpopError>;
+```
+
+
 
 ### Replay store
 Provide a store that return `true` only the first time it sees jti withint TTL window:
@@ -261,9 +296,8 @@ pub trait ReplayStore {
 ```
 
 ### Actix helpers
-```
-
-pub fn dpop_header_str<'a>(req: &'a actix_web::HttpRequest) -> Result<&'a str, DpopError>;
+```rust
+pub fn dpop_header_str(req: &actix_web::HttpRequest) -> Result<&str, DpopError>;
 pub fn expected_htu_from_actix(req: &actix_web::HttpRequest, trust_proxies: bool) -> String;
 ```
 
