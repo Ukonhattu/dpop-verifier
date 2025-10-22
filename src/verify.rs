@@ -391,7 +391,7 @@ impl DpopVerifier {
                             },
                             jkt: if *bind_jkt { Some(jkt) } else { None },
                         };
-                        let fresh_nonce = crate::nonce::issue_nonce(secret, current_time, &nonce_ctx);
+                        let fresh_nonce = crate::nonce::issue_nonce(secret, current_time, &nonce_ctx)?;
                         return Err(DpopError::UseDpopNonce { nonce: fresh_nonce });
                     }
                 };
@@ -413,7 +413,7 @@ impl DpopVerifier {
                 
                 if crate::nonce::verify_nonce(secret, nonce_value, current_time, *max_age_secs, &nonce_ctx).is_err() {
                     // On invalid/stale → emit NEW nonce so client can retry immediately
-                    let fresh_nonce = crate::nonce::issue_nonce(secret, current_time, &nonce_ctx);
+                    let fresh_nonce = crate::nonce::issue_nonce(secret, current_time, &nonce_ctx)?;
                     return Err(DpopError::UseDpopNonce { nonce: fresh_nonce });
                 }
             }
@@ -1106,7 +1106,7 @@ mod tests {
             htm: Some(expected_htm),
             jkt: Some(&jkt),
         };
-        let nonce = issue_nonce(&secret, now, &ctx);
+        let nonce = issue_nonce(&secret, now, &ctx).expect("issue_nonce");
 
         let h = serde_json::json!({"typ":"dpop+jwt","alg":"ES256","jwk":{"kty":"EC","crv":"P-256","x":x,"y":y}});
         let p = serde_json::json!({
@@ -1186,7 +1186,7 @@ mod tests {
             htm: Some(expected_htm),
             jkt: Some(&jkt),
         };
-        let nonce = issue_nonce(&secret, now, &ctx_wrong);
+        let nonce = issue_nonce(&secret, now, &ctx_wrong).expect("issue_nonce");
 
         let h = serde_json::json!({"typ":"dpop+jwt","alg":"ES256","jwk":{"kty":"EC","crv":"P-256","x":x,"y":y}});
         let p = serde_json::json!({
@@ -1231,7 +1231,7 @@ mod tests {
             htm: Some(expected_htm),
             jkt: Some(&jkt_a), // bind nonce to A's jkt
         };
-        let nonce = issue_nonce(&secret, now, &ctx);
+        let nonce = issue_nonce(&secret, now, &ctx).expect("issue_nonce");
 
         // Build proof with key B (=> jkt != jkt_a)
         let h = serde_json::json!({"typ":"dpop+jwt","alg":"ES256","jwk":{"kty":"EC","crv":"P-256","x":x_b,"y":y_b}});
@@ -1280,7 +1280,7 @@ mod tests {
                 htm: Some(expected_htm),
                 jkt: Some(&jkt),
             },
-        );
+        ).expect("issue_nonce");
 
         let h = serde_json::json!({"typ":"dpop+jwt","alg":"ES256","jwk":{"kty":"EC","crv":"P-256","x":x,"y":y}});
         let p = serde_json::json!({
@@ -1328,7 +1328,7 @@ mod tests {
                 htm: Some(expected_htm),
                 jkt: Some(&jkt),
             },
-        );
+        ).expect("issue_nonce");
 
         let h = serde_json::json!({"typ":"dpop+jwt","alg":"ES256","jwk":{"kty":"EC","crv":"P-256","x":x,"y":y}});
         let p = serde_json::json!({

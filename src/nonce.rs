@@ -55,20 +55,18 @@ fn ctx_bytes(ctx: &NonceCtx<'_>) -> Vec<u8> {
 
 /// Issue a fresh nonce bound to the given context.
 /// 
-/// # Panics
-/// This function will panic if the HMAC secret is invalid (which should never happen
-/// since HmacSha256 accepts keys of any length).
-pub fn issue_nonce(secret: &[u8], now_unix: i64, ctx: &NonceCtx<'_>) -> String {
+/// Returns an error if HMAC initialization fails (which should never happen as HMAC-SHA256 accepts any key length).
+pub fn issue_nonce(secret: &[u8], now_unix: i64, ctx: &NonceCtx<'_>) -> Result<String, DpopError> {
     let version_bytes = [NONCE_VERSION];
     let timestamp_bytes = now_unix.to_be_bytes();
 
     let mut random_bytes = [0u8; NONCE_RANDOM_LENGTH];
     OsRng.fill_bytes(&mut random_bytes);
 
-    // MAC over (version || timestamp || random || context)
-    // HMAC-SHA256 accepts keys of any length, so this should never fail
+    // HMAC-SHA256 accepts keys of any length; this should never fail
     let mut hmac = HmacSha256::new_from_slice(secret)
-        .expect("HMAC-SHA256 accepts keys of any length");
+        .map_err(|_| DpopError::InvalidHmacConfig)?;
+    
     hmac.update(&version_bytes);
     hmac.update(&timestamp_bytes);
     hmac.update(&random_bytes);
@@ -81,7 +79,7 @@ pub fn issue_nonce(secret: &[u8], now_unix: i64, ctx: &NonceCtx<'_>) -> String {
     nonce_bytes.extend_from_slice(&random_bytes);
     nonce_bytes.extend_from_slice(&mac_tag[..NONCE_MAC_LENGTH]);
 
-    B64.encode(nonce_bytes)
+    Ok(B64.encode(nonce_bytes))
 }
 
 /// Verify a nonce with age & skew limits, re-binding to the given context.
@@ -130,9 +128,10 @@ pub fn verify_nonce(
     }
 
     // Recompute MAC
-    // HMAC-SHA256 accepts keys of any length, so this should never fail
+    // HMAC-SHA256 accepts keys of any length; this should never fail
     let mut hmac = HmacSha256::new_from_slice(secret)
-        .expect("HMAC-SHA256 accepts keys of any length");
+        .map_err(|_| DpopError::InvalidHmacConfig)?;
+    
     hmac.update(&[version]);
     hmac.update(&timestamp.to_be_bytes());
     hmac.update(random_bytes);
@@ -182,7 +181,7 @@ mod tests {
             jkt: Some("thumb"),
         };
 
-        let nonce = issue_nonce(secret, current_time, &context);
+        let nonce = issue_nonce(secret, current_time, &context).expect("issue_nonce");
         assert!(verify_nonce(secret, &nonce, current_time, 300, &context).is_ok());
     }
 
@@ -195,7 +194,7 @@ mod tests {
             htm: Some("GET"),
             jkt: Some("t"),
         };
-        let nonce = issue_nonce(secret, current_time, &original_context);
+        let nonce = issue_nonce(secret, current_time, &original_context).expect("issue_nonce");
 
         // Change HTU → should fail
         let different_context = NonceCtx {
@@ -219,13 +218,13 @@ mod tests {
             jkt: None,
         };
 
-        let future_nonce = issue_nonce(secret, current_time + 10, &empty_context);
+        let future_nonce = issue_nonce(secret, current_time + 10, &empty_context).expect("issue_nonce");
         assert!(matches!(
             verify_nonce(secret, &future_nonce, current_time, 300, &empty_context),
             Err(DpopError::FutureSkew)
         ));
 
-        let stale_nonce = issue_nonce(secret, current_time - 301, &empty_context);
+        let stale_nonce = issue_nonce(secret, current_time - 301, &empty_context).expect("issue_nonce");
         assert!(matches!(
             verify_nonce(secret, &stale_nonce, current_time, 300, &empty_context),
             Err(DpopError::NonceStale)
@@ -243,12 +242,12 @@ mod tests {
             jkt: None,
         };
 
-        let nonce_from_previous = issue_nonce(previous_secret, current_time, &context);
+        let nonce_from_previous = issue_nonce(previous_secret, current_time, &context).expect("issue_nonce");
         assert!(
             verify_nonce_with_any(&[current_secret.as_slice(), previous_secret.as_slice()], &nonce_from_previous, current_time, 300, &context).is_ok()
         );
 
-        let nonce_from_current = issue_nonce(current_secret, current_time, &context);
+        let nonce_from_current = issue_nonce(current_secret, current_time, &context).expect("issue_nonce");
         assert!(
             verify_nonce_with_any(&[current_secret.as_slice(), previous_secret.as_slice()], &nonce_from_current, current_time, 300, &context).is_ok()
         );
