@@ -186,7 +186,7 @@ impl DpopVerifier {
         dpop_compact_jws: &str,
         expected_htu: &str,
         expected_htm: &str,
-        maybe_access_token: Option<&str>,
+        access_token: Option<&str>,
     ) -> Result<VerifiedDpop, DpopError> {
         // Parse the token
         let token = self.parse_token(dpop_compact_jws)?;
@@ -215,8 +215,8 @@ impl DpopVerifier {
             self.validate_http_binding(&claims, expected_htm, expected_htu)?;
 
         // Validate access token binding if present
-        if let Some(access_token) = maybe_access_token {
-            self.validate_access_token_binding(&claims, access_token)?;
+        if let Some(token) = access_token {
+            self.validate_access_token_binding(&claims, token)?;
         }
 
         // Check timestamp freshness
@@ -530,7 +530,7 @@ pub async fn verify_proof<S: ReplayStore + ?Sized>(
     dpop_compact_jws: &str,
     expected_htu: &str,
     expected_htm: &str,
-    maybe_access_token: Option<&str>,
+    access_token: Option<&str>,
     opts: VerifyOptions,
 ) -> Result<VerifiedDpop, DpopError> {
     let verifier = DpopVerifier { options: opts };
@@ -540,7 +540,7 @@ pub async fn verify_proof<S: ReplayStore + ?Sized>(
             dpop_compact_jws,
             expected_htu,
             expected_htm,
-            maybe_access_token,
+            access_token,
         )
         .await
 }

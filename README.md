@@ -17,7 +17,7 @@ Made this small crate for my own needs. If you feel it's lacking or is missing s
 Crates.io
 ```toml
 [dependencies]
-dpop-verifier = { version = "4.0", features = ["actix-web", "eddsa"] }
+dpop-verifier = { version = "4.0.1", features = ["actix-web", "eddsa"] }
 ```
 
 Git 
@@ -55,28 +55,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let expected_htm = "POST";
 
     // 3) If verifying at a Resource Server with an access token, pass it here (binds `ath`)
-    let maybe_access_token = None::<&str>;
+let access_token = None::<&str>;
 // Optional: bind proofs to an OAuth client identifier to prevent cross-client replays
-let maybe_client_id = None::<String>;
+let client_id = None::<String>;
 
 // 4) Create a verifier with your desired options (builder pattern)
 let mut verifier = DpopVerifier::new()
         .with_max_age(300)       // 300s max age
         .with_future_skew(5);    // 5s future skew tolerance
 
-if let Some(client_id) = maybe_client_id {
+if let Some(client_id) = client_id {
     verifier = verifier.with_client_binding(client_id);
 }
 
     // 5) Verify proof and record its `jti` (via your `ReplayStore`)
     let mut store = MyStore;
-    let verified = verifier.verify(
-        &mut store,
-        dpop,
-        expected_htu,
-        expected_htm,
-        maybe_access_token,
-    ).await?;
+    let verified = verifier
+        .verify(&mut store, dpop, expected_htu, expected_htm, access_token)
+        .await?;
 
     println!("DPoP key thumbprint (jkt): {}", verified.jkt);
     Ok(())
@@ -280,7 +276,7 @@ impl DpopVerifier {
         dpop_compact_jws: &str,
         expected_htu: &str,
         expected_htm: &str,
-        maybe_access_token: Option<&str>,
+        access_token: Option<&str>,
     ) -> Result<VerifiedDpop, DpopError>;
 }
 
@@ -304,7 +300,7 @@ pub async fn verify_proof<S: ReplayStore + ?Sized>(
     dpop_compact_jws: &str,
     expected_htu: &str,
     expected_htm: &str,
-    maybe_access_token: Option<&str>,
+    access_token: Option<&str>,
     opts: VerifyOptions,
 ) -> Result<VerifiedDpop, DpopError>;
 ```
