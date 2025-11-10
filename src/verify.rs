@@ -48,7 +48,7 @@ pub enum NonceMode {
     /// Stateless HMAC-based nonces: encode ts+rand+ctx and MAC it
     Hmac {
         secret: std::sync::Arc<[u8]>, // server secret
-        max_age_secs: i64,            // window (e.g., 300)
+        max_age_seconds: i64,         // window (e.g., 300)
         bind_htu_htm: bool,
         bind_jkt: bool,
         bind_client: bool,
@@ -57,16 +57,16 @@ pub enum NonceMode {
 
 #[derive(Debug, Clone)]
 pub struct VerifyOptions {
-    pub max_age_secs: i64,
-    pub future_skew_secs: i64,
+    pub max_age_seconds: i64,
+    pub future_skew_seconds: i64,
     pub nonce_mode: NonceMode,
     pub client_binding: Option<ClientBinding>,
 }
 impl Default for VerifyOptions {
     fn default() -> Self {
         Self {
-            max_age_secs: 300,
-            future_skew_secs: 5,
+            max_age_seconds: 300,
+            future_skew_seconds: 5,
             nonce_mode: NonceMode::Disabled,
             client_binding: None,
         }
@@ -147,15 +147,15 @@ impl DpopVerifier {
         }
     }
 
-    /// Set the maximum age for DPoP proofs
-    pub fn with_max_age(mut self, max_age_secs: i64) -> Self {
-        self.options.max_age_secs = max_age_secs;
+    /// Set the maximum age for DPoP proofs (in seconds)
+    pub fn with_max_age_seconds(mut self, max_age_seconds: i64) -> Self {
+        self.options.max_age_seconds = max_age_seconds;
         self
     }
 
-    /// Set the future skew tolerance
-    pub fn with_future_skew(mut self, future_skew_secs: i64) -> Self {
-        self.options.future_skew_secs = future_skew_secs;
+    /// Set the future skew tolerance (in seconds)
+    pub fn with_future_skew_seconds(mut self, future_skew_seconds: i64) -> Self {
+        self.options.future_skew_seconds = future_skew_seconds;
         self
     }
 
@@ -390,10 +390,10 @@ impl DpopVerifier {
     /// Check timestamp freshness with configured limits
     fn check_timestamp_freshness(&self, iat: i64) -> Result<(), DpopError> {
         let current_time = OffsetDateTime::now_utc().unix_timestamp();
-        if iat > current_time + self.options.future_skew_secs {
+        if iat > current_time + self.options.future_skew_seconds {
             return Err(DpopError::FutureSkew);
         }
-        if current_time - iat > self.options.max_age_secs {
+        if current_time - iat > self.options.max_age_seconds {
             return Err(DpopError::Stale);
         }
         Ok(())
@@ -419,7 +419,7 @@ impl DpopVerifier {
             }
             NonceMode::Hmac {
                 secret,
-                max_age_secs,
+                max_age_seconds,
                 bind_htu_htm,
                 bind_jkt,
                 bind_client,
@@ -469,7 +469,7 @@ impl DpopVerifier {
                     secret,
                     nonce_value,
                     current_time,
-                    *max_age_secs,
+                    *max_age_seconds,
                     &nonce_ctx,
                 )
                 .is_err()
@@ -890,13 +890,18 @@ mod tests {
         let h = serde_json::json!({"typ":"dpop+jwt","alg":"ES256","jwk":{"kty":"EC","crv":"P-256","x":x,"y":y}});
 
         // Future skew just over limit
-        let p_future =
-            serde_json::json!({"jti":"jf","iat":now + 6,"htm":"GET","htu":"https://ex.com/a"});
+        let future_skew_seconds = 5;
+        let p_future = serde_json::json!({
+            "jti":"jf",
+            "iat":now + future_skew_seconds + 5,
+            "htm":"GET",
+            "htu":"https://ex.com/a"
+        });
         let jws_future = make_jws(&sk, h.clone(), p_future);
         let mut store1 = MemoryStore::default();
         let opts = VerifyOptions {
-            max_age_secs: 300,
-            future_skew_secs: 5,
+            max_age_seconds: 300,
+            future_skew_seconds,
             nonce_mode: NonceMode::Disabled,
             client_binding: None,
         };
@@ -918,8 +923,8 @@ mod tests {
         let jws_stale = make_jws(&sk, h.clone(), p_stale);
         let mut store2 = MemoryStore::default();
         let opts = VerifyOptions {
-            max_age_secs: 300,
-            future_skew_secs: 5,
+            max_age_seconds: 300,
+            future_skew_seconds,
             nonce_mode: NonceMode::Disabled,
             client_binding: None,
         };
@@ -1081,8 +1086,8 @@ mod tests {
 
         let mut store = MemoryStore::default();
         let opts = VerifyOptions {
-            max_age_secs: 300,
-            future_skew_secs: 5,
+            max_age_seconds: 300,
+            future_skew_seconds: 5,
             nonce_mode: NonceMode::RequireEqual {
                 expected_nonce: expected_nonce.to_string(),
             },
@@ -1113,8 +1118,8 @@ mod tests {
 
         let mut store = MemoryStore::default();
         let opts = VerifyOptions {
-            max_age_secs: 300,
-            future_skew_secs: 5,
+            max_age_seconds: 300,
+            future_skew_seconds: 5,
             nonce_mode: NonceMode::RequireEqual {
                 expected_nonce: "x".into(),
             },
@@ -1147,8 +1152,8 @@ mod tests {
 
         let mut store = MemoryStore::default();
         let opts = VerifyOptions {
-            max_age_secs: 300,
-            future_skew_secs: 5,
+            max_age_seconds: 300,
+            future_skew_seconds: 5,
             nonce_mode: NonceMode::RequireEqual {
                 expected_nonce: expected_nonce.into(),
             },
@@ -1198,11 +1203,11 @@ mod tests {
 
         let mut store = MemoryStore::default();
         let opts = VerifyOptions {
-            max_age_secs: 300,
-            future_skew_secs: 5,
+            max_age_seconds: 300,
+            future_skew_seconds: 5,
             nonce_mode: NonceMode::Hmac {
                 secret: secret.clone(),
-                max_age_secs: 300,
+                max_age_seconds: 300,
                 bind_htu_htm: true,
                 bind_jkt: true,
                 bind_client: false,
@@ -1236,11 +1241,11 @@ mod tests {
 
         let mut store = MemoryStore::default();
         let opts = VerifyOptions {
-            max_age_secs: 300,
-            future_skew_secs: 5,
+            max_age_seconds: 300,
+            future_skew_seconds: 5,
             nonce_mode: NonceMode::Hmac {
                 secret: secret.clone(),
-                max_age_secs: 300,
+                max_age_seconds: 300,
                 bind_htu_htm: true,
                 bind_jkt: true,
                 bind_client: false,
@@ -1283,11 +1288,11 @@ mod tests {
 
         let mut store = MemoryStore::default();
         let opts = VerifyOptions {
-            max_age_secs: 300,
-            future_skew_secs: 5,
+            max_age_seconds: 300,
+            future_skew_seconds: 5,
             nonce_mode: NonceMode::Hmac {
                 secret: secret.clone(),
-                max_age_secs: 300,
+                max_age_seconds: 300,
                 bind_htu_htm: true,
                 bind_jkt: true,
                 bind_client: false,
@@ -1332,11 +1337,11 @@ mod tests {
 
         let mut store = MemoryStore::default();
         let opts = VerifyOptions {
-            max_age_secs: 300,
-            future_skew_secs: 5,
+            max_age_seconds: 300,
+            future_skew_seconds: 5,
             nonce_mode: NonceMode::Hmac {
                 secret: secret.clone(),
-                max_age_secs: 300,
+                max_age_seconds: 300,
                 bind_htu_htm: true,
                 bind_jkt: true,
                 bind_client: false,
@@ -1384,11 +1389,11 @@ mod tests {
 
         let mut store = MemoryStore::default();
         let opts = VerifyOptions {
-            max_age_secs: 300,
-            future_skew_secs: 5,
+            max_age_seconds: 300,
+            future_skew_seconds: 5,
             nonce_mode: NonceMode::Hmac {
                 secret: secret.clone(),
-                max_age_secs: 300,
+                max_age_seconds: 300,
                 bind_htu_htm: true,
                 bind_jkt: true,
                 bind_client: false,
@@ -1436,11 +1441,11 @@ mod tests {
 
         let mut store = MemoryStore::default();
         let opts = VerifyOptions {
-            max_age_secs: 300,
-            future_skew_secs: 5,
+            max_age_seconds: 300,
+            future_skew_seconds: 5,
             nonce_mode: NonceMode::Hmac {
                 secret: secret.clone(),
-                max_age_secs: 300,
+                max_age_seconds: 300,
                 bind_htu_htm: true,
                 bind_jkt: true,
                 bind_client: false,
@@ -1483,11 +1488,11 @@ mod tests {
 
         let mut store = MemoryStore::default();
         let opts = VerifyOptions {
-            max_age_secs: 300,
-            future_skew_secs: 5,
+            max_age_seconds: 300,
+            future_skew_seconds: 5,
             nonce_mode: NonceMode::Hmac {
                 secret: secret.clone(),
-                max_age_secs: 300,
+                max_age_seconds: 300,
                 bind_htu_htm: true,
                 bind_jkt: true,
                 bind_client: true,
@@ -1532,11 +1537,11 @@ mod tests {
 
         let mut store = MemoryStore::default();
         let opts = VerifyOptions {
-            max_age_secs: 300,
-            future_skew_secs: 5,
+            max_age_seconds: 300,
+            future_skew_seconds: 5,
             nonce_mode: NonceMode::Hmac {
                 secret: secret.clone(),
-                max_age_secs: 300,
+                max_age_seconds: 300,
                 bind_htu_htm: true,
                 bind_jkt: true,
                 bind_client: true,

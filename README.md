@@ -17,7 +17,7 @@ Made this small crate for my own needs. If you feel it's lacking or is missing s
 Crates.io
 ```toml
 [dependencies]
-dpop-verifier = { version = "4.0.1", features = ["actix-web", "eddsa"] }
+dpop-verifier = { version = "4.1.0", features = ["actix-web", "eddsa"] }
 ```
 
 Git 
@@ -61,8 +61,8 @@ let client_id = None::<String>;
 
 // 4) Create a verifier with your desired options (builder pattern)
 let mut verifier = DpopVerifier::new()
-        .with_max_age(300)       // 300s max age
-        .with_future_skew(5);    // 5s future skew tolerance
+        .with_max_age_seconds(300)       // 300s max age
+        .with_future_skew_seconds(5);    // 5s future skew tolerance
 
 if let Some(client_id) = client_id {
     verifier = verifier.with_client_binding(client_id);
@@ -111,11 +111,11 @@ async fn protected(req: actix_web::HttpRequest, app: actix_web::web::Data<App>)
     // Create verifier with HMAC nonce mode
     // If you also have an access token, pass it as Some(token) to bind `ath`.
     let mut verifier = DpopVerifier::new()
-        .with_max_age(300)
-        .with_future_skew(5)
+        .with_max_age_seconds(300)
+        .with_future_skew_seconds(5)
         .with_nonce_mode(NonceMode::Hmac {
             secret: app.dpop_secret.clone(),
-            max_age_secs: 300,
+            max_age_seconds: 300,
             bind_htu_htm: true,
             bind_jkt: true,
             bind_client: true,
@@ -176,8 +176,8 @@ async fn protected(req: actix_web::HttpRequest, user_id: String) -> actix_web::H
     };
 
     let verifier = DpopVerifier::new()
-        .with_max_age(300)
-        .with_future_skew(5)
+        .with_max_age_seconds(300)
+        .with_future_skew_seconds(5)
         .with_nonce_mode(NonceMode::RequireEqual { 
             expected_nonce: expected.clone() 
         });
@@ -236,8 +236,8 @@ async fn handler(req: actix_web::HttpRequest) -> actix_web::Result<()> {
     // let mut store = ...
 
     let mut verifier = DpopVerifier::new()
-        .with_max_age(300)
-        .with_future_skew(5);
+        .with_max_age_seconds(300)
+        .with_future_skew_seconds(5);
 
     // Optionally bind the proof to your own client identifier (if available)
     // if let Some(client_id) = client_id_for_request(&req) {
@@ -264,8 +264,8 @@ pub struct DpopVerifier {
 
 impl DpopVerifier {
     pub fn new() -> Self;
-    pub fn with_max_age(self, max_age_secs: i64) -> Self;
-    pub fn with_future_skew(self, future_skew_secs: i64) -> Self;
+    pub fn with_max_age_seconds(self, max_age_seconds: i64) -> Self;
+    pub fn with_future_skew_seconds(self, future_skew_seconds: i64) -> Self;
     pub fn with_nonce_mode(self, nonce_mode: NonceMode) -> Self;
     pub fn with_client_binding(self, client_id: impl Into<String>) -> Self;
     pub fn without_client_binding(self) -> Self;

@@ -38,7 +38,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut store = MemoryStore(HashSet::new());
 
     // Use the new DpopVerifier API with builder pattern
-    let mut verifier = DpopVerifier::new().with_max_age(300).with_future_skew(5);
+    let mut verifier = DpopVerifier::new()
+        .with_max_age_seconds(300)
+        .with_future_skew_seconds(5);
 
     if let Ok(client_id) = std::env::var("CLIENT_ID") {
         verifier = verifier.with_client_binding(client_id);
