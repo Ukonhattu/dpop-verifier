@@ -7,6 +7,7 @@ A tiny DPoP proof verifier for Rust:
 - Manual claim checks (htm/htu/iat/ath)
 - Pluggable replay store (DB/Redis/etc.)
 - DPoP-Nonce support
+- Optional client binding for per-client replay protection
 - Optional Actix helper to canonicalize request URL
 
 Made this small crate for my own needs. If you feel it's lacking or is missing something and/or does not actually follow the spec etc. feel free to open an issue.
@@ -16,7 +17,7 @@ Made this small crate for my own needs. If you feel it's lacking or is missing s
 Crates.io
 ```toml
 [dependencies]
-dpop-verifier = { version = "2.0", features = ["actix-web", "eddsa"] }
+dpop-verifier = { version = "2.1", features = ["actix-web", "eddsa"] }
 ```
 
 Git 
@@ -55,11 +56,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 3) If verifying at a Resource Server with an access token, pass it here (binds `ath`)
     let maybe_access_token = None::<&str>;
+// Optional: bind proofs to an OAuth client identifier to prevent cross-client replays
+let maybe_client_id = None::<String>;
 
-    // 4) Create a verifier with your desired options (builder pattern)
-    let verifier = DpopVerifier::new()
+// 4) Create a verifier with your desired options (builder pattern)
+let mut verifier = DpopVerifier::new()
         .with_max_age(300)       // 300s max age
         .with_future_skew(5);    // 5s future skew tolerance
+
+if let Some(client_id) = maybe_client_id {
+    verifier = verifier.with_client_binding(client_id);
+}
 
     // 5) Verify proof and record its `jti` (via your `ReplayStore`)
     let mut store = MyStore;
@@ -85,6 +92,11 @@ use dpop_verifier::{DpopVerifier, NonceMode, DpopError};
 #[cfg(feature="actix-web")]
 use dpop_verifier::actix_helpers::{dpop_header_str, expected_htu_from_actix};
 
+fn client_id_for_request(_req: &actix_web::HttpRequest) -> Option<String> {
+    // Look up the client identifier associated with this request (OAuth client_id, etc.)
+    None
+}
+
 struct App {
     dpop_secret: Arc<[u8]>, // keep in app state; rotate periodically
 }
@@ -102,7 +114,7 @@ async fn protected(req: actix_web::HttpRequest, app: actix_web::web::Data<App>)
 
     // Create verifier with HMAC nonce mode
     // If you also have an access token, pass it as Some(token) to bind `ath`.
-    let verifier = DpopVerifier::new()
+    let mut verifier = DpopVerifier::new()
         .with_max_age(300)
         .with_future_skew(5)
         .with_nonce_mode(NonceMode::Hmac {
@@ -110,7 +122,12 @@ async fn protected(req: actix_web::HttpRequest, app: actix_web::web::Data<App>)
             max_age_secs: 300,
             bind_htu_htm: true,
             bind_jkt: true,
+            bind_client: true,
         });
+
+    if let Some(client_id) = client_id_for_request(&req) {
+        verifier = verifier.with_client_binding(client_id);
+    }
 
     match verifier.verify(&mut (), dpop, &expected_htu, expected_htm, None).await {
         Ok(verified) => {
@@ -191,6 +208,7 @@ async fn protected(req: actix_web::HttpRequest, user_id: String) -> actix_web::H
 Notes
 
 - In HMAC mode, you usually don’t pre-issue a nonce—the verifier will return UseDpopNonce { nonce } when needed, and you just forward that value.
+- Set `bind_client: true` and call `.with_client_binding(..)` if you want the nonce to be scoped to a particular OAuth client.
 
 Always expose `WWW-Authenticate` / `DPoP-Nonce` to browsers:
 
@@ -221,9 +239,14 @@ async fn handler(req: actix_web::HttpRequest) -> actix_web::Result<()> {
     // ... get your ReplayStore
     // let mut store = ...
 
-    let verifier = DpopVerifier::new()
+    let mut verifier = DpopVerifier::new()
         .with_max_age(300)
         .with_future_skew(5);
+
+    // Optionally bind the proof to your own client identifier (if available)
+    // if let Some(client_id) = client_id_for_request(&req) {
+    //     verifier = verifier.with_client_binding(client_id);
+    // }
 
     verifier.verify(&mut store, dpop, &expected_htu, expected_htm, None)
         .await
@@ -248,6 +271,8 @@ impl DpopVerifier {
     pub fn with_max_age(self, max_age_secs: i64) -> Self;
     pub fn with_future_skew(self, future_skew_secs: i64) -> Self;
     pub fn with_nonce_mode(self, nonce_mode: NonceMode) -> Self;
+    pub fn with_client_binding(self, client_id: impl Into<String>) -> Self;
+    pub fn without_client_binding(self) -> Self;
     
     pub async fn verify<S: ReplayStore + ?Sized>(
         &self,
@@ -263,6 +288,10 @@ pub struct VerifiedDpop {
     pub jkt: String, // JWK SHA-256 thumbprint (base64url, no pad)
     pub jti: String,
     pub iat: i64,
+}
+
+pub struct ClientBinding {
+    pub client_id: String,
 }
 ```
 
@@ -290,7 +319,7 @@ pub trait ReplayStore {
     async fn insert_once(
         &mut self,
         jti_hash: [u8; 32],         // SHA-256 of jti
-        ctx: ReplayContext<'_>,     // { jkt, htm, htu, iat }
+        ctx: ReplayContext<'_>,     // { jkt, htm, htu, client_id, iat }
     ) -> Result<bool, DpopError>;
 }
 ```

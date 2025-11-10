@@ -36,12 +36,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::env::var("ACCESS_TOKEN").expect("set ACCESS_TOKEN env var for RS verification");
 
     let mut store = MemoryStore(HashSet::new());
-    
+
     // Use the new DpopVerifier API with builder pattern
-    let verifier = DpopVerifier::new()
-        .with_max_age(300)
-        .with_future_skew(5);
-    
+    let mut verifier = DpopVerifier::new().with_max_age(300).with_future_skew(5);
+
+    if let Ok(client_id) = std::env::var("CLIENT_ID") {
+        verifier = verifier.with_client_binding(client_id);
+    }
+
     let verified = verifier
         .verify(
             &mut store,

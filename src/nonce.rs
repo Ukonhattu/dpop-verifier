@@ -31,6 +31,7 @@ pub struct NonceCtx<'a> {
     pub htu: Option<&'a str>,
     pub htm: Option<&'a str>,
     pub jkt: Option<&'a str>,
+    pub client: Option<&'a str>,
 }
 
 fn ctx_bytes(ctx: &NonceCtx<'_>) -> Vec<u8> {
@@ -50,11 +51,16 @@ fn ctx_bytes(ctx: &NonceCtx<'_>) -> Vec<u8> {
         context_bytes.extend_from_slice(jkt.as_bytes());
         context_bytes.push(0);
     }
+    if let Some(client_id) = ctx.client {
+        context_bytes.extend_from_slice(b"CID\0");
+        context_bytes.extend_from_slice(client_id.as_bytes());
+        context_bytes.push(0);
+    }
     context_bytes
 }
 
 /// Issue a fresh nonce bound to the given context.
-/// 
+///
 /// Returns an error if HMAC initialization fails (which should never happen as HMAC-SHA256 accepts any key length).
 pub fn issue_nonce(secret: &[u8], now_unix: i64, ctx: &NonceCtx<'_>) -> Result<String, DpopError> {
     let version_bytes = [NONCE_VERSION];
@@ -64,9 +70,8 @@ pub fn issue_nonce(secret: &[u8], now_unix: i64, ctx: &NonceCtx<'_>) -> Result<S
     OsRng.fill_bytes(&mut random_bytes);
 
     // HMAC-SHA256 accepts keys of any length; this should never fail
-    let mut hmac = HmacSha256::new_from_slice(secret)
-        .map_err(|_| DpopError::InvalidHmacConfig)?;
-    
+    let mut hmac = HmacSha256::new_from_slice(secret).map_err(|_| DpopError::InvalidHmacConfig)?;
+
     hmac.update(&version_bytes);
     hmac.update(&timestamp_bytes);
     hmac.update(&random_bytes);
@@ -94,7 +99,7 @@ pub fn verify_nonce(
     let nonce_bytes = B64
         .decode(nonce_b64.as_bytes())
         .map_err(|_| DpopError::NonceMismatch)?;
-    
+
     if nonce_bytes.len() != NONCE_TOTAL_LENGTH {
         return Err(DpopError::NonceMismatch);
     }
@@ -129,9 +134,8 @@ pub fn verify_nonce(
 
     // Recompute MAC
     // HMAC-SHA256 accepts keys of any length; this should never fail
-    let mut hmac = HmacSha256::new_from_slice(secret)
-        .map_err(|_| DpopError::InvalidHmacConfig)?;
-    
+    let mut hmac = HmacSha256::new_from_slice(secret).map_err(|_| DpopError::InvalidHmacConfig)?;
+
     hmac.update(&[version]);
     hmac.update(&timestamp.to_be_bytes());
     hmac.update(random_bytes);
@@ -179,6 +183,7 @@ mod tests {
             htu: Some("https://ex.com/a"),
             htm: Some("POST"),
             jkt: Some("thumb"),
+            client: None,
         };
 
         let nonce = issue_nonce(secret, current_time, &context).expect("issue_nonce");
@@ -193,6 +198,7 @@ mod tests {
             htu: Some("https://ex.com/a"),
             htm: Some("GET"),
             jkt: Some("t"),
+            client: None,
         };
         let nonce = issue_nonce(secret, current_time, &original_context).expect("issue_nonce");
 
@@ -201,6 +207,7 @@ mod tests {
             htu: Some("https://ex.com/b"),
             htm: Some("GET"),
             jkt: Some("t"),
+            client: None,
         };
         assert!(matches!(
             verify_nonce(secret, &nonce, current_time, 300, &different_context),
@@ -216,15 +223,18 @@ mod tests {
             htu: None,
             htm: None,
             jkt: None,
+            client: None,
         };
 
-        let future_nonce = issue_nonce(secret, current_time + 10, &empty_context).expect("issue_nonce");
+        let future_nonce =
+            issue_nonce(secret, current_time + 10, &empty_context).expect("issue_nonce");
         assert!(matches!(
             verify_nonce(secret, &future_nonce, current_time, 300, &empty_context),
             Err(DpopError::FutureSkew)
         ));
 
-        let stale_nonce = issue_nonce(secret, current_time - 301, &empty_context).expect("issue_nonce");
+        let stale_nonce =
+            issue_nonce(secret, current_time - 301, &empty_context).expect("issue_nonce");
         assert!(matches!(
             verify_nonce(secret, &stale_nonce, current_time, 300, &empty_context),
             Err(DpopError::NonceStale)
@@ -240,16 +250,29 @@ mod tests {
             htu: Some("u"),
             htm: Some("M"),
             jkt: None,
+            client: None,
         };
 
-        let nonce_from_previous = issue_nonce(previous_secret, current_time, &context).expect("issue_nonce");
-        assert!(
-            verify_nonce_with_any(&[current_secret.as_slice(), previous_secret.as_slice()], &nonce_from_previous, current_time, 300, &context).is_ok()
-        );
+        let nonce_from_previous =
+            issue_nonce(previous_secret, current_time, &context).expect("issue_nonce");
+        assert!(verify_nonce_with_any(
+            &[current_secret.as_slice(), previous_secret.as_slice()],
+            &nonce_from_previous,
+            current_time,
+            300,
+            &context
+        )
+        .is_ok());
 
-        let nonce_from_current = issue_nonce(current_secret, current_time, &context).expect("issue_nonce");
-        assert!(
-            verify_nonce_with_any(&[current_secret.as_slice(), previous_secret.as_slice()], &nonce_from_current, current_time, 300, &context).is_ok()
-        );
+        let nonce_from_current =
+            issue_nonce(current_secret, current_time, &context).expect("issue_nonce");
+        assert!(verify_nonce_with_any(
+            &[current_secret.as_slice(), previous_secret.as_slice()],
+            &nonce_from_current,
+            current_time,
+            300,
+            &context
+        )
+        .is_ok());
     }
 }

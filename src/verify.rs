@@ -51,6 +51,7 @@ pub enum NonceMode {
         max_age_secs: i64,            // window (e.g., 300)
         bind_htu_htm: bool,
         bind_jkt: bool,
+        bind_client: bool,
     },
 }
 
@@ -59,6 +60,7 @@ pub struct VerifyOptions {
     pub max_age_secs: i64,
     pub future_skew_secs: i64,
     pub nonce_mode: NonceMode,
+    pub client_binding: Option<ClientBinding>,
 }
 impl Default for VerifyOptions {
     fn default() -> Self {
@@ -66,6 +68,20 @@ impl Default for VerifyOptions {
             max_age_secs: 300,
             future_skew_secs: 5,
             nonce_mode: NonceMode::Disabled,
+            client_binding: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ClientBinding {
+    pub client_id: String,
+}
+
+impl ClientBinding {
+    pub fn new(client_id: impl Into<String>) -> Self {
+        Self {
+            client_id: client_id.into(),
         }
     }
 }
@@ -149,6 +165,20 @@ impl DpopVerifier {
         self
     }
 
+    /// Bind verification to a specific client identifier
+    pub fn with_client_binding(mut self, client_id: impl Into<String>) -> Self {
+        self.options.client_binding = Some(ClientBinding {
+            client_id: client_id.into(),
+        });
+        self
+    }
+
+    /// Remove any configured client binding
+    pub fn without_client_binding(mut self) -> Self {
+        self.options.client_binding = None;
+        self
+    }
+
     /// Verify a DPoP proof
     pub async fn verify<S: ReplayStore + ?Sized>(
         &self,
@@ -160,48 +190,58 @@ impl DpopVerifier {
     ) -> Result<VerifiedDpop, DpopError> {
         // Parse the token
         let token = self.parse_token(dpop_compact_jws)?;
-        
+
         // Validate header
         self.validate_header(&token.header)?;
-        
+
         // Verify signature and compute JKT
         let jkt = self.verify_signature_and_compute_jkt(&token)?;
-        
+
         // Parse claims
         let claims: DpopClaims = {
-            let bytes = B64.decode(&token.payload_b64).map_err(|_| DpopError::MalformedJws)?;
+            let bytes = B64
+                .decode(&token.payload_b64)
+                .map_err(|_| DpopError::MalformedJws)?;
             serde_json::from_slice(&bytes).map_err(|_| DpopError::MalformedJws)?
         };
-        
+
         // Validate JTI length
         if claims.jti.len() > JTI_MAX_LENGTH {
             return Err(DpopError::JtiTooLong);
         }
-        
+
         // Validate HTTP binding (HTM/HTU)
-        let (expected_htm_normalized, expected_htu_normalized) = 
+        let (expected_htm_normalized, expected_htu_normalized) =
             self.validate_http_binding(&claims, expected_htm, expected_htu)?;
-        
+
         // Validate access token binding if present
         if let Some(access_token) = maybe_access_token {
             self.validate_access_token_binding(&claims, access_token)?;
         }
-        
+
         // Check timestamp freshness
         self.check_timestamp_freshness(claims.iat)?;
-        
+
+        let client_binding = self
+            .options
+            .client_binding
+            .as_ref()
+            .map(|binding| binding.client_id.as_str());
+
         // Validate nonce if required
         self.validate_nonce_if_required(
             &claims,
             &expected_htu_normalized,
             &expected_htm_normalized,
             &jkt,
+            client_binding,
         )?;
-        
+
         // Prevent replay
         let jti_hash = JtiHash::from_jti(&claims.jti);
-        self.prevent_replay(store, jti_hash, &claims, &jkt).await?;
-        
+        self.prevent_replay(store, jti_hash, &claims, &jkt, client_binding)
+            .await?;
+
         Ok(VerifiedDpop {
             jkt,
             jti: claims.jti,
@@ -212,14 +252,17 @@ impl DpopVerifier {
     /// Parse compact JWS into token components
     fn parse_token(&self, dpop_compact_jws: &str) -> Result<DpopToken, DpopError> {
         let mut jws_parts = dpop_compact_jws.split('.');
-        let (header_b64, payload_b64, signature_b64) = match (jws_parts.next(), jws_parts.next(), jws_parts.next()) {
-            (Some(h), Some(p), Some(s)) if jws_parts.next().is_none() => (h, p, s),
-            _ => return Err(DpopError::MalformedJws),
-        };
+        let (header_b64, payload_b64, signature_b64) =
+            match (jws_parts.next(), jws_parts.next(), jws_parts.next()) {
+                (Some(h), Some(p), Some(s)) if jws_parts.next().is_none() => (h, p, s),
+                _ => return Err(DpopError::MalformedJws),
+            };
 
         // Decode JOSE header
         let header: DpopHeader = {
-            let bytes = B64.decode(header_b64).map_err(|_| DpopError::MalformedJws)?;
+            let bytes = B64
+                .decode(header_b64)
+                .map_err(|_| DpopError::MalformedJws)?;
             let val: serde_json::Value =
                 serde_json::from_slice(&bytes).map_err(|_| DpopError::MalformedJws)?;
             // MUST NOT include private JWK material
@@ -230,7 +273,9 @@ impl DpopVerifier {
         };
 
         let signing_input = format!("{}.{}", header_b64, payload_b64);
-        let signature_bytes = B64.decode(signature_b64).map_err(|_| DpopError::InvalidSignature)?;
+        let signature_bytes = B64
+            .decode(signature_b64)
+            .map_err(|_| DpopError::InvalidSignature)?;
 
         Ok(DpopToken {
             header,
@@ -259,7 +304,8 @@ impl DpopVerifier {
                 let verifying_key: VerifyingKey = verifying_key_from_p256_xy(x, y)?;
                 let signature = p256::ecdsa::Signature::from_slice(&token.signature_bytes)
                     .map_err(|_| DpopError::InvalidSignature)?;
-                verifying_key.verify(token.signing_input.as_bytes(), &signature)
+                verifying_key
+                    .verify(token.signing_input.as_bytes(), &signature)
                     .map_err(|_| DpopError::InvalidSignature)?;
                 // compute EC thumbprint
                 thumbprint_ec_p256(x, y)?
@@ -277,7 +323,8 @@ impl DpopVerifier {
                 let verifying_key: EdVk = crate::jwk::verifying_key_from_okp_ed25519(x)?;
                 let signature = EdSig::from_slice(&token.signature_bytes)
                     .map_err(|_| DpopError::InvalidSignature)?;
-                verifying_key.verify(token.signing_input.as_bytes(), &signature)
+                verifying_key
+                    .verify(token.signing_input.as_bytes(), &signature)
                     .map_err(|_| DpopError::InvalidSignature)?;
                 crate::jwk::thumbprint_okp_ed25519(x)?
             }
@@ -323,15 +370,17 @@ impl DpopVerifier {
     ) -> Result<(), DpopError> {
         // Compute expected SHA-256 bytes of the exact token octets
         let expected_hash = Sha256::digest(access_token.as_bytes());
-        
+
         // Decode provided ath (must be base64url no-pad)
         let ath_b64 = claims.ath.as_ref().ok_or(DpopError::MissingAth)?;
         let actual_hash = B64
             .decode(ath_b64.as_bytes())
             .map_err(|_| DpopError::AthMalformed)?;
-        
+
         // Constant-time compare of raw digests
-        if actual_hash.len() != expected_hash.len() || !bool::from(actual_hash.ct_eq(&expected_hash[..])) {
+        if actual_hash.len() != expected_hash.len()
+            || !bool::from(actual_hash.ct_eq(&expected_hash[..]))
+        {
             return Err(DpopError::AthMismatch);
         }
 
@@ -357,6 +406,7 @@ impl DpopVerifier {
         expected_htu_normalized: &str,
         expected_htm_normalized: &str,
         jkt: &str,
+        client_binding: Option<&str>,
     ) -> Result<(), DpopError> {
         match &self.options.nonce_mode {
             NonceMode::Disabled => { /* do nothing */ }
@@ -372,6 +422,7 @@ impl DpopVerifier {
                 max_age_secs,
                 bind_htu_htm,
                 bind_jkt,
+                bind_client,
             } => {
                 let nonce_value = match &claims.nonce {
                     Some(s) => s.as_str(),
@@ -390,12 +441,14 @@ impl DpopVerifier {
                                 None
                             },
                             jkt: if *bind_jkt { Some(jkt) } else { None },
+                            client: if *bind_client { client_binding } else { None },
                         };
-                        let fresh_nonce = crate::nonce::issue_nonce(secret, current_time, &nonce_ctx)?;
+                        let fresh_nonce =
+                            crate::nonce::issue_nonce(secret, current_time, &nonce_ctx)?;
                         return Err(DpopError::UseDpopNonce { nonce: fresh_nonce });
                     }
                 };
-                
+
                 let current_time = time::OffsetDateTime::now_utc().unix_timestamp();
                 let nonce_ctx = crate::nonce::NonceCtx {
                     htu: if *bind_htu_htm {
@@ -409,9 +462,18 @@ impl DpopVerifier {
                         None
                     },
                     jkt: if *bind_jkt { Some(jkt) } else { None },
+                    client: if *bind_client { client_binding } else { None },
                 };
-                
-                if crate::nonce::verify_nonce(secret, nonce_value, current_time, *max_age_secs, &nonce_ctx).is_err() {
+
+                if crate::nonce::verify_nonce(
+                    secret,
+                    nonce_value,
+                    current_time,
+                    *max_age_secs,
+                    &nonce_ctx,
+                )
+                .is_err()
+                {
                     // On invalid/stale → emit NEW nonce so client can retry immediately
                     let fresh_nonce = crate::nonce::issue_nonce(secret, current_time, &nonce_ctx)?;
                     return Err(DpopError::UseDpopNonce { nonce: fresh_nonce });
@@ -428,6 +490,7 @@ impl DpopVerifier {
         jti_hash: JtiHash,
         claims: &DpopClaims,
         jkt: &str,
+        client_binding: Option<&str>,
     ) -> Result<(), DpopError> {
         let is_first_use = store
             .insert_once(
@@ -436,11 +499,12 @@ impl DpopVerifier {
                     jkt: Some(jkt),
                     htm: Some(&claims.htm),
                     htu: Some(&claims.htu),
+                    client_id: client_binding,
                     iat: claims.iat,
                 },
             )
             .await?;
-        
+
         if !is_first_use {
             return Err(DpopError::Replay);
         }
@@ -456,7 +520,7 @@ impl Default for DpopVerifier {
 }
 
 /// Verify DPoP proof and record the jti to prevent replays.
-/// 
+///
 /// # Deprecated
 /// This function is maintained for backward compatibility. New code should use `DpopVerifier` instead.
 /// See the `DpopVerifier` documentation for usage examples.
@@ -469,10 +533,16 @@ pub async fn verify_proof<S: ReplayStore + ?Sized>(
     maybe_access_token: Option<&str>,
     opts: VerifyOptions,
 ) -> Result<VerifiedDpop, DpopError> {
-    let verifier = DpopVerifier {
-        options: opts,
-    };
-    verifier.verify(store, dpop_compact_jws, expected_htu, expected_htm, maybe_access_token).await
+    let verifier = DpopVerifier { options: opts };
+    verifier
+        .verify(
+            store,
+            dpop_compact_jws,
+            expected_htu,
+            expected_htm,
+            maybe_access_token,
+        )
+        .await
 }
 
 #[cfg(test)]
@@ -578,6 +648,7 @@ mod tests {
                     jkt: Some("j"),
                     htm: Some("POST"),
                     htu: Some("https://ex"),
+                    client_id: None,
                     iat: 0,
                 },
             )
@@ -590,6 +661,7 @@ mod tests {
                     jkt: Some("j"),
                     htm: Some("POST"),
                     htu: Some("https://ex"),
+                    client_id: None,
                     iat: 0,
                 },
             )
@@ -826,6 +898,7 @@ mod tests {
             max_age_secs: 300,
             future_skew_secs: 5,
             nonce_mode: NonceMode::Disabled,
+            client_binding: None,
         };
         let err = verify_proof(
             &mut store1,
@@ -848,6 +921,7 @@ mod tests {
             max_age_secs: 300,
             future_skew_secs: 5,
             nonce_mode: NonceMode::Disabled,
+            client_binding: None,
         };
         let err = verify_proof(
             &mut store2,
@@ -1012,6 +1086,7 @@ mod tests {
             nonce_mode: NonceMode::RequireEqual {
                 expected_nonce: expected_nonce.to_string(),
             },
+            client_binding: None,
         };
         assert!(
             verify_proof(&mut store, &jws, expected_htu, expected_htm, None, opts)
@@ -1043,6 +1118,7 @@ mod tests {
             nonce_mode: NonceMode::RequireEqual {
                 expected_nonce: "x".into(),
             },
+            client_binding: None,
         };
         let err = verify_proof(&mut store, &jws, expected_htu, expected_htm, None, opts)
             .await
@@ -1076,6 +1152,7 @@ mod tests {
             nonce_mode: NonceMode::RequireEqual {
                 expected_nonce: expected_nonce.into(),
             },
+            client_binding: None,
         };
         let err = verify_proof(&mut store, &jws, expected_htu, expected_htm, None, opts)
             .await
@@ -1105,6 +1182,7 @@ mod tests {
             htu: Some(expected_htu),
             htm: Some(expected_htm),
             jkt: Some(&jkt),
+            client: None,
         };
         let nonce = issue_nonce(&secret, now, &ctx).expect("issue_nonce");
 
@@ -1127,7 +1205,9 @@ mod tests {
                 max_age_secs: 300,
                 bind_htu_htm: true,
                 bind_jkt: true,
+                bind_client: false,
             },
+            client_binding: None,
         };
         assert!(
             verify_proof(&mut store, &jws, expected_htu, expected_htm, None, opts)
@@ -1163,7 +1243,9 @@ mod tests {
                 max_age_secs: 300,
                 bind_htu_htm: true,
                 bind_jkt: true,
+                bind_client: false,
             },
+            client_binding: None,
         };
         let err = verify_proof(&mut store, &jws, expected_htu, expected_htm, None, opts)
             .await
@@ -1185,6 +1267,7 @@ mod tests {
             htu: Some("https://ex.com/wrong"),
             htm: Some(expected_htm),
             jkt: Some(&jkt),
+            client: None,
         };
         let nonce = issue_nonce(&secret, now, &ctx_wrong).expect("issue_nonce");
 
@@ -1207,7 +1290,9 @@ mod tests {
                 max_age_secs: 300,
                 bind_htu_htm: true,
                 bind_jkt: true,
+                bind_client: false,
             },
+            client_binding: None,
         };
         let err = verify_proof(&mut store, &jws, expected_htu, expected_htm, None, opts)
             .await
@@ -1230,6 +1315,7 @@ mod tests {
             htu: Some(expected_htu),
             htm: Some(expected_htm),
             jkt: Some(&jkt_a), // bind nonce to A's jkt
+            client: None,
         };
         let nonce = issue_nonce(&secret, now, &ctx).expect("issue_nonce");
 
@@ -1253,7 +1339,9 @@ mod tests {
                 max_age_secs: 300,
                 bind_htu_htm: true,
                 bind_jkt: true,
+                bind_client: false,
             },
+            client_binding: None,
         };
         let err = verify_proof(&mut store, &jws, expected_htu, expected_htm, None, opts)
             .await
@@ -1279,8 +1367,10 @@ mod tests {
                 htu: Some(expected_htu),
                 htm: Some(expected_htm),
                 jkt: Some(&jkt),
+                client: None,
             },
-        ).expect("issue_nonce");
+        )
+        .expect("issue_nonce");
 
         let h = serde_json::json!({"typ":"dpop+jwt","alg":"ES256","jwk":{"kty":"EC","crv":"P-256","x":x,"y":y}});
         let p = serde_json::json!({
@@ -1301,7 +1391,9 @@ mod tests {
                 max_age_secs: 300,
                 bind_htu_htm: true,
                 bind_jkt: true,
+                bind_client: false,
             },
+            client_binding: None,
         };
         let err = verify_proof(&mut store, &jws, expected_htu, expected_htm, None, opts)
             .await
@@ -1327,8 +1419,10 @@ mod tests {
                 htu: Some(expected_htu),
                 htm: Some(expected_htm),
                 jkt: Some(&jkt),
+                client: None,
             },
-        ).expect("issue_nonce");
+        )
+        .expect("issue_nonce");
 
         let h = serde_json::json!({"typ":"dpop+jwt","alg":"ES256","jwk":{"kty":"EC","crv":"P-256","x":x,"y":y}});
         let p = serde_json::json!({
@@ -1349,12 +1443,124 @@ mod tests {
                 max_age_secs: 300,
                 bind_htu_htm: true,
                 bind_jkt: true,
+                bind_client: false,
             },
+            client_binding: None,
         };
         let err = verify_proof(&mut store, &jws, expected_htu, expected_htm, None, opts)
             .await
             .unwrap_err();
         matches!(err, DpopError::UseDpopNonce { .. });
+    }
+
+    #[tokio::test]
+    async fn nonce_hmac_client_binding_ok() {
+        let (sk, x, y) = gen_es256_key();
+        let now = OffsetDateTime::now_utc().unix_timestamp();
+        let expected_htu = "https://ex.com/a";
+        let expected_htm = "GET";
+        let client_id = "client-123";
+
+        let jkt = thumbprint_ec_p256(&x, &y).unwrap();
+        let secret: Arc<[u8]> = Arc::from(&b"secret-client"[..]);
+        let ctx = crate::nonce::NonceCtx {
+            htu: Some(expected_htu),
+            htm: Some(expected_htm),
+            jkt: Some(&jkt),
+            client: Some(client_id),
+        };
+        let nonce = issue_nonce(&secret, now, &ctx).expect("issue_nonce");
+
+        let h = serde_json::json!({"typ":"dpop+jwt","alg":"ES256","jwk":{"kty":"EC","crv":"P-256","x":x,"y":y}});
+        let p = serde_json::json!({
+            "jti":"n-hmac-client-ok",
+            "iat":now,
+            "htm":expected_htm,
+            "htu":expected_htu,
+            "nonce": nonce
+        });
+        let jws = make_jws(&sk, h, p);
+
+        let mut store = MemoryStore::default();
+        let opts = VerifyOptions {
+            max_age_secs: 300,
+            future_skew_secs: 5,
+            nonce_mode: NonceMode::Hmac {
+                secret: secret.clone(),
+                max_age_secs: 300,
+                bind_htu_htm: true,
+                bind_jkt: true,
+                bind_client: true,
+            },
+            client_binding: Some(ClientBinding::new(client_id)),
+        };
+        assert!(
+            verify_proof(&mut store, &jws, expected_htu, expected_htm, None, opts)
+                .await
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn nonce_hmac_client_binding_mismatch_prompts_use_dpop_nonce() {
+        let (sk, x, y) = gen_es256_key();
+        let now = OffsetDateTime::now_utc().unix_timestamp();
+        let expected_htu = "https://ex.com/a";
+        let expected_htm = "GET";
+        let issue_client_id = "client-issuer";
+        let verify_client_id = "client-verifier";
+
+        let jkt = thumbprint_ec_p256(&x, &y).unwrap();
+        let secret: Arc<[u8]> = Arc::from(&b"secret-client-mismatch"[..]);
+        let ctx = crate::nonce::NonceCtx {
+            htu: Some(expected_htu),
+            htm: Some(expected_htm),
+            jkt: Some(&jkt),
+            client: Some(issue_client_id),
+        };
+        let nonce = issue_nonce(&secret, now, &ctx).expect("issue_nonce");
+
+        let h = serde_json::json!({"typ":"dpop+jwt","alg":"ES256","jwk":{"kty":"EC","crv":"P-256","x":x,"y":y}});
+        let p = serde_json::json!({
+            "jti":"n-hmac-client-mismatch",
+            "iat":now,
+            "htm":expected_htm,
+            "htu":expected_htu,
+            "nonce": nonce
+        });
+        let jws = make_jws(&sk, h, p);
+
+        let mut store = MemoryStore::default();
+        let opts = VerifyOptions {
+            max_age_secs: 300,
+            future_skew_secs: 5,
+            nonce_mode: NonceMode::Hmac {
+                secret: secret.clone(),
+                max_age_secs: 300,
+                bind_htu_htm: true,
+                bind_jkt: true,
+                bind_client: true,
+            },
+            client_binding: Some(ClientBinding::new(verify_client_id)),
+        };
+        let err = verify_proof(&mut store, &jws, expected_htu, expected_htm, None, opts)
+            .await
+            .unwrap_err();
+        if let DpopError::UseDpopNonce { nonce: new_nonce } = err {
+            // Response nonce should be bound to the verifier's client binding
+            let retry_ctx = crate::nonce::NonceCtx {
+                htu: Some(expected_htu),
+                htm: Some(expected_htm),
+                jkt: Some(&jkt),
+                client: Some(verify_client_id),
+            };
+            assert!(
+                crate::nonce::verify_nonce(&secret, &new_nonce, now, 300, &retry_ctx).is_ok(),
+                "returned nonce should bind to verifier client id"
+            );
+        } else {
+            panic!("expected UseDpopNonce, got {err:?}");
+        }
     }
 
     #[cfg(feature = "eddsa")]

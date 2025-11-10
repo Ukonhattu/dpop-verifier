@@ -6,6 +6,7 @@ pub struct ReplayContext<'a> {
     pub jkt: Option<&'a str>,
     pub htm: Option<&'a str>,
     pub htu: Option<&'a str>,
+    pub client_id: Option<&'a str>,
     pub iat: i64,
 }
 

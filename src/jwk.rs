@@ -22,7 +22,8 @@ pub fn verifying_key_from_p256_xy(x_b64: &str, y_b64: &str) -> Result<VerifyingK
         .decode(y_b64)
         .map_err(|_| DpopError::BadJwk("bad jwk.y"))?;
 
-    if x_coordinate.len() != P256_COORDINATE_LENGTH || y_coordinate.len() != P256_COORDINATE_LENGTH {
+    if x_coordinate.len() != P256_COORDINATE_LENGTH || y_coordinate.len() != P256_COORDINATE_LENGTH
+    {
         return Err(DpopError::BadJwk("jwk x/y must be 32 bytes"));
     }
 
@@ -32,7 +33,8 @@ pub fn verifying_key_from_p256_xy(x_b64: &str, y_b64: &str) -> Result<VerifyingK
         /* compress = */ false,
     );
 
-    VerifyingKey::from_encoded_point(&encoded_point).map_err(|_| DpopError::BadJwk("invalid EC point"))
+    VerifyingKey::from_encoded_point(&encoded_point)
+        .map_err(|_| DpopError::BadJwk("invalid EC point"))
 }
 
 pub fn thumbprint_ec_p256(x_b64: &str, y_b64: &str) -> Result<String, DpopError> {
@@ -41,7 +43,8 @@ pub fn thumbprint_ec_p256(x_b64: &str, y_b64: &str) -> Result<String, DpopError>
     canonical_jwk_map.insert("kty", "EC");
     canonical_jwk_map.insert("x", x_b64);
     canonical_jwk_map.insert("y", y_b64);
-    let canonical_json = serde_json::to_string(&canonical_jwk_map).map_err(|_| DpopError::BadJwk("canonicalize"))?;
+    let canonical_json =
+        serde_json::to_string(&canonical_jwk_map).map_err(|_| DpopError::BadJwk("canonicalize"))?;
     Ok(B64.encode(Sha256::digest(canonical_json.as_bytes())))
 }
 
@@ -52,15 +55,15 @@ pub fn verifying_key_from_okp_ed25519(
     let key_bytes_vec = B64
         .decode(x_b64)
         .map_err(|_| crate::DpopError::BadJwk("bad jwk.x"))?;
-    
+
     if key_bytes_vec.len() != ED25519_KEY_LENGTH {
         return Err(crate::DpopError::BadJwk("jwk x must be 32 bytes"));
     }
-    
+
     let key_bytes: [u8; ED25519_KEY_LENGTH] = key_bytes_vec
         .try_into()
         .map_err(|_| crate::DpopError::BadJwk("invalid key length"))?;
-    
+
     Ed25519VerifyingKey::from_bytes(&key_bytes)
         .map_err(|_| crate::DpopError::BadJwk("invalid Ed25519 key"))
 }
@@ -72,8 +75,8 @@ pub fn thumbprint_okp_ed25519(x_b64: &str) -> Result<String, crate::DpopError> {
     canonical_jwk_map.insert("crv", "Ed25519");
     canonical_jwk_map.insert("kty", "OKP");
     canonical_jwk_map.insert("x", x_b64);
-    let canonical_json =
-        serde_json::to_string(&canonical_jwk_map).map_err(|_| crate::DpopError::BadJwk("canonicalize"))?;
+    let canonical_json = serde_json::to_string(&canonical_jwk_map)
+        .map_err(|_| crate::DpopError::BadJwk("canonicalize"))?;
     Ok(B64.encode(Sha256::digest(canonical_json.as_bytes())))
 }
 
