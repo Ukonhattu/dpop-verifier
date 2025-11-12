@@ -13,10 +13,47 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64;
 use base64::Engine;
 use hmac::{Hmac, Mac};
 use rand_core::{OsRng, RngCore};
+use secrecy::{ExposeSecret, SecretBox};
 use sha2::Sha256;
 use subtle::ConstantTimeEq;
 
 use crate::DpopError;
+
+/// Helper trait to convert various secret types into `SecretBox<[u8]>`.
+/// This allows functions to accept both `SecretBox<[u8]>` and non-boxed types like `&[u8]` or `Vec<u8>`.
+pub trait IntoSecretBox {
+    fn into_secret_box(self) -> SecretBox<[u8]>;
+}
+
+impl IntoSecretBox for SecretBox<[u8]> {
+    fn into_secret_box(self) -> SecretBox<[u8]> {
+        self
+    }
+}
+
+impl IntoSecretBox for &SecretBox<[u8]> {
+    fn into_secret_box(self) -> SecretBox<[u8]> {
+        self.clone()
+    }
+}
+
+impl IntoSecretBox for &[u8] {
+    fn into_secret_box(self) -> SecretBox<[u8]> {
+        SecretBox::from(self.to_vec())
+    }
+}
+
+impl IntoSecretBox for Vec<u8> {
+    fn into_secret_box(self) -> SecretBox<[u8]> {
+        SecretBox::from(self)
+    }
+}
+
+impl IntoSecretBox for &Vec<u8> {
+    fn into_secret_box(self) -> SecretBox<[u8]> {
+        SecretBox::from(self.clone())
+    }
+}
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -60,9 +97,14 @@ fn ctx_bytes(ctx: &NonceCtx<'_>) -> Vec<u8> {
 }
 
 /// Issue a fresh nonce bound to the given context.
-///
-/// Returns an error if HMAC initialization fails (which should never happen as HMAC-SHA256 accepts any key length).
-pub fn issue_nonce(secret: &[u8], now_unix: i64, ctx: &NonceCtx<'_>) -> Result<String, DpopError> {
+/// 
+/// Accepts either a `SecretBox<[u8]>` or any type that can be converted to bytes (e.g., `&[u8]`, `Vec<u8>`).
+/// Non-boxed types will be automatically converted to `SecretBox` internally.
+pub fn issue_nonce<S>(secret: S, now_unix: i64, ctx: &NonceCtx<'_>) -> Result<String, DpopError>
+where
+    S: IntoSecretBox,
+{
+    let secret_box = secret.into_secret_box();
     let version_bytes = [NONCE_VERSION];
     let timestamp_bytes = now_unix.to_be_bytes();
 
@@ -70,7 +112,7 @@ pub fn issue_nonce(secret: &[u8], now_unix: i64, ctx: &NonceCtx<'_>) -> Result<S
     OsRng.fill_bytes(&mut random_bytes);
 
     // HMAC-SHA256 accepts keys of any length; this should never fail
-    let mut hmac = HmacSha256::new_from_slice(secret).map_err(|_| DpopError::InvalidHmacConfig)?;
+    let mut hmac = HmacSha256::new_from_slice(secret_box.expose_secret()).map_err(|_| DpopError::InvalidHmacConfig)?;
 
     hmac.update(&version_bytes);
     hmac.update(&timestamp_bytes);
@@ -89,13 +131,20 @@ pub fn issue_nonce(secret: &[u8], now_unix: i64, ctx: &NonceCtx<'_>) -> Result<S
 
 /// Verify a nonce with age & skew limits, re-binding to the given context.
 /// On success returns Ok(()); on failure returns a DpopError (NonceMismatch/NonceStale/FutureSkew).
-pub fn verify_nonce(
-    secret: &[u8],
+/// 
+/// Accepts either a `SecretBox<[u8]>` or any type that can be converted to bytes (e.g., `&[u8]`, `Vec<u8>`).
+/// Non-boxed types will be automatically converted to `SecretBox` internally.
+pub fn verify_nonce<S>(
+    secret: S,
     nonce_b64: &str,
     now_unix: i64,
     max_age_secs: i64,
     ctx: &NonceCtx<'_>,
-) -> Result<(), DpopError> {
+) -> Result<(), DpopError>
+where
+    S: IntoSecretBox,
+{
+    let secret_box = secret.into_secret_box();
     let nonce_bytes = B64
         .decode(nonce_b64.as_bytes())
         .map_err(|_| DpopError::NonceMismatch)?;
@@ -134,7 +183,7 @@ pub fn verify_nonce(
 
     // Recompute MAC
     // HMAC-SHA256 accepts keys of any length; this should never fail
-    let mut hmac = HmacSha256::new_from_slice(secret).map_err(|_| DpopError::InvalidHmacConfig)?;
+    let mut hmac = HmacSha256::new_from_slice(secret_box.expose_secret()).map_err(|_| DpopError::InvalidHmacConfig)?;
 
     hmac.update(&[version]);
     hmac.update(&timestamp.to_be_bytes());
@@ -150,16 +199,22 @@ pub fn verify_nonce(
 }
 
 /// Verify against multiple secrets (e.g., key rotation: current, previous).
-pub fn verify_nonce_with_any(
-    secrets: &[&[u8]],
+/// 
+/// Accepts a slice of secrets, where each secret can be either a `SecretBox<[u8]>` or any type
+/// that can be converted to bytes (e.g., `&[u8]`, `Vec<u8>`).
+pub fn verify_nonce_with_any<S>(
+    secrets: &[S],
     nonce_b64: &str,
     now_unix: i64,
     max_age_secs: i64,
     ctx: &NonceCtx<'_>,
-) -> Result<(), DpopError> {
+) -> Result<(), DpopError>
+where
+    S: IntoSecretBox + Clone,
+{
     let mut last_error = DpopError::NonceMismatch;
     for secret in secrets {
-        match verify_nonce(secret, nonce_b64, now_unix, max_age_secs, ctx) {
+        match verify_nonce(secret.clone(), nonce_b64, now_unix, max_age_secs, ctx) {
             Ok(()) => return Ok(()),
             Err(error @ DpopError::FutureSkew)
             | Err(error @ DpopError::NonceStale)
@@ -177,7 +232,7 @@ mod tests {
 
     #[test]
     fn roundtrip_ok_with_binding() {
-        let secret = b"supersecretkey";
+        let secret = SecretBox::from(b"supersecretkey".to_vec());
         let current_time = OffsetDateTime::now_utc().unix_timestamp();
         let context = NonceCtx {
             htu: Some("https://ex.com/a"),
@@ -186,13 +241,13 @@ mod tests {
             client: None,
         };
 
-        let nonce = issue_nonce(secret, current_time, &context).expect("issue_nonce");
-        assert!(verify_nonce(secret, &nonce, current_time, 300, &context).is_ok());
+        let nonce = issue_nonce(&secret, current_time, &context).expect("issue_nonce");
+        assert!(verify_nonce(&secret, &nonce, current_time, 300, &context).is_ok());
     }
 
     #[test]
     fn bad_ctx_fails() {
-        let secret = b"k";
+        let secret = SecretBox::from(b"k".to_vec());
         let current_time = OffsetDateTime::now_utc().unix_timestamp();
         let original_context = NonceCtx {
             htu: Some("https://ex.com/a"),
@@ -200,7 +255,7 @@ mod tests {
             jkt: Some("t"),
             client: None,
         };
-        let nonce = issue_nonce(secret, current_time, &original_context).expect("issue_nonce");
+        let nonce = issue_nonce(&secret, current_time, &original_context).expect("issue_nonce");
 
         // Change HTU → should fail
         let different_context = NonceCtx {
@@ -210,14 +265,14 @@ mod tests {
             client: None,
         };
         assert!(matches!(
-            verify_nonce(secret, &nonce, current_time, 300, &different_context),
+            verify_nonce(&secret, &nonce, current_time, 300, &different_context),
             Err(DpopError::NonceMismatch)
         ));
     }
 
     #[test]
     fn stale_and_future_skew() {
-        let secret = b"k2";
+        let secret = SecretBox::from(b"k2".to_vec());
         let current_time = OffsetDateTime::now_utc().unix_timestamp();
         let empty_context = NonceCtx {
             htu: None,
@@ -227,24 +282,24 @@ mod tests {
         };
 
         let future_nonce =
-            issue_nonce(secret, current_time + 10, &empty_context).expect("issue_nonce");
+            issue_nonce(&secret, current_time + 10, &empty_context).expect("issue_nonce");
         assert!(matches!(
-            verify_nonce(secret, &future_nonce, current_time, 300, &empty_context),
+            verify_nonce(&secret, &future_nonce, current_time, 300, &empty_context),
             Err(DpopError::FutureSkew)
         ));
 
         let stale_nonce =
-            issue_nonce(secret, current_time - 301, &empty_context).expect("issue_nonce");
+            issue_nonce(&secret, current_time - 301, &empty_context).expect("issue_nonce");
         assert!(matches!(
-            verify_nonce(secret, &stale_nonce, current_time, 300, &empty_context),
+            verify_nonce(&secret, &stale_nonce, current_time, 300, &empty_context),
             Err(DpopError::NonceStale)
         ));
     }
 
     #[test]
     fn rotation_any_secret() {
-        let current_secret = b"current";
-        let previous_secret = b"previous";
+        let current_secret = SecretBox::from(b"current".to_vec());
+        let previous_secret = SecretBox::from(b"previous".to_vec());
         let current_time = OffsetDateTime::now_utc().unix_timestamp();
         let context = NonceCtx {
             htu: Some("u"),
@@ -254,9 +309,9 @@ mod tests {
         };
 
         let nonce_from_previous =
-            issue_nonce(previous_secret, current_time, &context).expect("issue_nonce");
+            issue_nonce(&previous_secret, current_time, &context).expect("issue_nonce");
         assert!(verify_nonce_with_any(
-            &[current_secret.as_slice(), previous_secret.as_slice()],
+            &[&current_secret, &previous_secret],
             &nonce_from_previous,
             current_time,
             300,
@@ -265,14 +320,35 @@ mod tests {
         .is_ok());
 
         let nonce_from_current =
-            issue_nonce(current_secret, current_time, &context).expect("issue_nonce");
+            issue_nonce(&current_secret, current_time, &context).expect("issue_nonce");
         assert!(verify_nonce_with_any(
-            &[current_secret.as_slice(), previous_secret.as_slice()],
+            &[&current_secret, &previous_secret],
             &nonce_from_current,
             current_time,
             300,
             &context
         )
         .is_ok());
+    }
+
+    #[test]
+    fn accepts_non_boxed_types() {
+        // Test that functions accept &[u8] directly
+        let secret_bytes = b"test-secret";
+        let current_time = OffsetDateTime::now_utc().unix_timestamp();
+        let context = NonceCtx {
+            htu: Some("https://ex.com/a"),
+            htm: Some("GET"),
+            jkt: Some("thumb"),
+            client: None,
+        };
+
+        let nonce = issue_nonce(secret_bytes.as_slice(), current_time, &context).expect("issue_nonce");
+        assert!(verify_nonce(secret_bytes.as_slice(), &nonce, current_time, 300, &context).is_ok());
+
+        // Test with Vec<u8>
+        let secret_vec = b"test-secret-vec".to_vec();
+        let nonce2 = issue_nonce(&secret_vec, current_time, &context).expect("issue_nonce");
+        assert!(verify_nonce(&secret_vec, &nonce2, current_time, 300, &context).is_ok());
     }
 }

@@ -47,8 +47,8 @@ pub enum NonceMode {
     },
     /// Stateless HMAC-based nonces: encode ts+rand+ctx and MAC it
     Hmac {
-        secret: std::sync::Arc<[u8]>, // server secret
-        max_age_seconds: i64,         // window (e.g., 300)
+        secret: secrecy::SecretBox<[u8]>,
+        max_age_seconds: i64,
         bind_htu_htm: bool,
         bind_jkt: bool,
         bind_client: bool,
@@ -552,7 +552,7 @@ mod tests {
     use crate::nonce::issue_nonce;
     use p256::ecdsa::{signature::Signer, Signature, SigningKey};
     use rand_core::OsRng;
-    use std::sync::Arc;
+    use secrecy::SecretBox;
 
     // ---- helpers ----------------------------------------------------------------
 
@@ -1182,7 +1182,7 @@ mod tests {
         // Compute jkt from header jwk x/y to match verifier's jkt
         let jkt = thumbprint_ec_p256(&x, &y).unwrap();
 
-        let secret: Arc<[u8]> = Arc::from(&b"supersecret"[..]);
+        let secret = SecretBox::from(b"supersecret".to_vec());
         let ctx = crate::nonce::NonceCtx {
             htu: Some(expected_htu),
             htm: Some(expected_htm),
@@ -1228,7 +1228,7 @@ mod tests {
         let expected_htu = "https://ex.com/a";
         let expected_htm = "GET";
 
-        let secret: Arc<[u8]> = Arc::from(&b"supersecret"[..]);
+        let secret = SecretBox::from(b"supersecret".to_vec());
 
         let h = serde_json::json!({"typ":"dpop+jwt","alg":"ES256","jwk":{"kty":"EC","crv":"P-256","x":x,"y":y}});
         let p = serde_json::json!({
@@ -1267,7 +1267,7 @@ mod tests {
 
         // Bind nonce to a different HTU to force mismatch
         let jkt = thumbprint_ec_p256(&x, &y).unwrap();
-        let secret: Arc<[u8]> = Arc::from(&b"k"[..]);
+        let secret = SecretBox::from(b"k".to_vec());
         let ctx_wrong = crate::nonce::NonceCtx {
             htu: Some("https://ex.com/wrong"),
             htm: Some(expected_htm),
@@ -1315,7 +1315,7 @@ mod tests {
         let expected_htm = "GET";
 
         let jkt_a = thumbprint_ec_p256(&x_a, &y_a).unwrap();
-        let secret: Arc<[u8]> = Arc::from(&b"secret-2"[..]);
+        let secret = SecretBox::from(b"secret-2".to_vec());
         let ctx = crate::nonce::NonceCtx {
             htu: Some(expected_htu),
             htm: Some(expected_htm),
@@ -1362,7 +1362,7 @@ mod tests {
         let expected_htm = "GET";
 
         let jkt = thumbprint_ec_p256(&x, &y).unwrap();
-        let secret: Arc<[u8]> = Arc::from(&b"secret-3"[..]);
+        let secret = SecretBox::from(b"secret-3".to_vec());
         // Issue with ts older than max_age
         let issued_ts = now - 400;
         let nonce = issue_nonce(
@@ -1414,7 +1414,7 @@ mod tests {
         let expected_htm = "GET";
 
         let jkt = thumbprint_ec_p256(&x, &y).unwrap();
-        let secret: Arc<[u8]> = Arc::from(&b"secret-4"[..]);
+        let secret = SecretBox::from(b"secret-4".to_vec());
         // Issue with ts in the future beyond 5s tolerance
         let issued_ts = now + 10;
         let nonce = issue_nonce(
@@ -1467,7 +1467,7 @@ mod tests {
         let client_id = "client-123";
 
         let jkt = thumbprint_ec_p256(&x, &y).unwrap();
-        let secret: Arc<[u8]> = Arc::from(&b"secret-client"[..]);
+        let secret = SecretBox::from(b"secret-client".to_vec());
         let ctx = crate::nonce::NonceCtx {
             htu: Some(expected_htu),
             htm: Some(expected_htm),
@@ -1516,7 +1516,7 @@ mod tests {
         let verify_client_id = "client-verifier";
 
         let jkt = thumbprint_ec_p256(&x, &y).unwrap();
-        let secret: Arc<[u8]> = Arc::from(&b"secret-client-mismatch"[..]);
+        let secret = SecretBox::from(b"secret-client-mismatch".to_vec());
         let ctx = crate::nonce::NonceCtx {
             htu: Some(expected_htu),
             htm: Some(expected_htm),
