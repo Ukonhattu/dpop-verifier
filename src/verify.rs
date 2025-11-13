@@ -7,6 +7,7 @@ use subtle::ConstantTimeEq;
 use time::OffsetDateTime;
 
 use crate::jwk::{thumbprint_ec_p256, verifying_key_from_p256_xy};
+use crate::nonce::IntoSecretBox;
 use crate::replay::{ReplayContext, ReplayStore};
 use crate::DpopError;
 use p256::ecdsa::{signature::Verifier, VerifyingKey};
@@ -53,6 +54,54 @@ pub enum NonceMode {
         bind_jkt: bool,
         bind_client: bool,
     },
+}
+
+impl NonceMode {
+    /// Create an HMAC nonce mode with a secret that can be converted to `SecretBox<[u8]>`.
+    /// 
+    /// Accepts either a `SecretBox<[u8]>` or any type that can be converted to bytes
+    /// (e.g., `&[u8]`, `Vec<u8>`). Non-boxed types will be automatically converted to
+    /// `SecretBox` internally.
+    /// 
+    /// # Example
+    /// 
+    /// ```rust
+    /// use dpop_verifier::NonceMode;
+    /// 
+    /// // With a byte array (b"..." syntax)
+    /// let mode = NonceMode::hmac(b"my-secret-key", 300, true, true, true);
+    /// 
+    /// // With a byte slice
+    /// let secret_slice: &[u8] = b"my-secret-key";
+    /// let mode = NonceMode::hmac(secret_slice, 300, true, true, true);
+    /// 
+    /// // With a Vec<u8>
+    /// let secret = b"my-secret-key".to_vec();
+    /// let mode = NonceMode::hmac(&secret, 300, true, true, true);
+    /// 
+    /// // With a SecretBox (already boxed)
+    /// use secrecy::SecretBox;
+    /// let secret_box = SecretBox::from(b"my-secret-key".to_vec());
+    /// let mode = NonceMode::hmac(&secret_box, 300, true, true, true);
+    /// ```
+    pub fn hmac<S>(
+        secret: S,
+        max_age_seconds: i64,
+        bind_htu_htm: bool,
+        bind_jkt: bool,
+        bind_client: bool,
+    ) -> Self
+    where
+        S: IntoSecretBox,
+    {
+        NonceMode::Hmac {
+            secret: secret.into_secret_box(),
+            max_age_seconds,
+            bind_htu_htm,
+            bind_jkt,
+            bind_client,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1566,6 +1615,74 @@ mod tests {
         } else {
             panic!("expected UseDpopNonce, got {err:?}");
         }
+    }
+
+    #[tokio::test]
+    async fn nonce_hmac_constructor_with_non_boxed_types() {
+        // Test that NonceMode::hmac() works with non-boxed types
+        let (sk, x, y) = gen_es256_key();
+        let now = OffsetDateTime::now_utc().unix_timestamp();
+        let expected_htu = "https://ex.com/a";
+        let expected_htm = "GET";
+        let jkt = thumbprint_ec_p256(&x, &y).unwrap();
+
+        // Test with byte array (b"..." syntax)
+        let secret_bytes = b"test-secret-bytes";
+        let ctx = crate::nonce::NonceCtx {
+            htu: Some(expected_htu),
+            htm: Some(expected_htm),
+            jkt: Some(&jkt),
+            client: None,
+        };
+        let nonce = crate::nonce::issue_nonce(secret_bytes, now, &ctx).expect("issue_nonce");
+
+        let h = serde_json::json!({"typ":"dpop+jwt","alg":"ES256","jwk":{"kty":"EC","crv":"P-256","x":x,"y":y}});
+        let p = serde_json::json!({
+            "jti":"n-hmac-constructor-test",
+            "iat":now,
+            "htm":expected_htm,
+            "htu":expected_htu,
+            "nonce": nonce
+        });
+        let jws = make_jws(&sk, h, p);
+
+        let mut store = MemoryStore::default();
+        // Use the new constructor with a byte array directly (no .as_slice() needed!)
+        let opts = VerifyOptions {
+            max_age_seconds: 300,
+            future_skew_seconds: 5,
+            nonce_mode: NonceMode::hmac(secret_bytes, 300, true, true, false),
+            client_binding: None,
+        };
+        assert!(
+            verify_proof(&mut store, &jws, expected_htu, expected_htm, None, opts)
+                .await
+                .is_ok()
+        );
+
+        // Test with Vec<u8>
+        let secret_vec = b"test-secret-vec".to_vec();
+        let nonce2 = crate::nonce::issue_nonce(&secret_vec, now, &ctx).expect("issue_nonce");
+        let p2 = serde_json::json!({
+            "jti":"n-hmac-constructor-test-2",
+            "iat":now,
+            "htm":expected_htm,
+            "htu":expected_htu,
+            "nonce": nonce2
+        });
+        let jws2 = make_jws(&sk, serde_json::json!({"typ":"dpop+jwt","alg":"ES256","jwk":{"kty":"EC","crv":"P-256","x":x,"y":y}}), p2);
+        let mut store2 = MemoryStore::default();
+        let opts2 = VerifyOptions {
+            max_age_seconds: 300,
+            future_skew_seconds: 5,
+            nonce_mode: NonceMode::hmac(&secret_vec, 300, true, true, false),
+            client_binding: None,
+        };
+        assert!(
+            verify_proof(&mut store2, &jws2, expected_htu, expected_htm, None, opts2)
+                .await
+                .is_ok()
+        );
     }
 
     #[cfg(feature = "eddsa")]

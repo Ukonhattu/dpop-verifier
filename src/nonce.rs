@@ -43,6 +43,12 @@ impl IntoSecretBox for &[u8] {
     }
 }
 
+impl<const N: usize> IntoSecretBox for &[u8; N] {
+    fn into_secret_box(self) -> SecretBox<[u8]> {
+        SecretBox::from(self.to_vec())
+    }
+}
+
 impl IntoSecretBox for Vec<u8> {
     fn into_secret_box(self) -> SecretBox<[u8]> {
         SecretBox::from(self)
