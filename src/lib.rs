@@ -13,5 +13,5 @@ pub use jwk::{thumbprint_ec_p256, verifying_key_from_p256_xy};
 pub use nonce::IntoSecretBox;
 pub use replay::{ReplayContext, ReplayStore};
 pub use verify::{
-    verify_proof, ClientBinding, DpopVerifier, NonceMode, VerifiedDpop, VerifyOptions,
+    verify_proof, ClientBinding, DpopVerifier, HmacConfig, NonceMode, VerifiedDpop, VerifyOptions,
 };
